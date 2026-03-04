@@ -1,0 +1,1248 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# CLI wrapper for AirogelCmsClient
+# Usage: bin/airogelcms <theme_name> <action> [options]
+#
+# Actions:
+#   # Theme operations
+#   download_theme      - Download entire theme (database + templates + assets)
+#   download_database   - Download just database.yml
+#   download_templates  - Download just templates
+#   download_assets     - Download just assets
+#   upload_theme        - Upload entire theme (templates + assets)
+#   upload_templates    - Upload just templates
+#   upload_assets       - Upload just assets
+#
+#   # List operations
+#   list_accounts       - List available CMS accounts
+#   list_templates      - List templates for the account
+#   list_assets         - List assets for the account
+#   list_collections    - List collections
+#   list_entries        - List entries in a collection (--collection required)
+#   list_blueprints     - List blueprints
+#   list_navigations    - List navigations
+#   list_globals        - List globals
+#
+#   # CRUD operations (use --key=value for options)
+#   get_collection      - Get collection by ID or handle (--id required)
+#   create_collection   - Create a collection (--name, --handle required)
+#   update_collection   - Update a collection (--id required)
+#   delete_collection   - Delete a collection (--id required)
+#
+#   get_entry           - Get entry by ID or handle (--collection, --id required)
+#   create_entry        - Create an entry (--collection required, fields as options)
+#   update_entry        - Update an entry (--collection, --id required)
+#   delete_entry        - Delete an entry (--collection, --id required)
+#
+#   get_blueprint       - Get blueprint by ID or handle (--id required)
+#   create_blueprint    - Create a blueprint (--handle, --title required, --fields JSON)
+#   update_blueprint    - Update a blueprint (--id required)
+#   delete_blueprint    - Delete a blueprint (--id required)
+#
+#   get_navigation      - Get navigation by ID or handle (--id required)
+#   create_navigation   - Create a navigation (--handle, --title required)
+#   update_navigation   - Update a navigation (--id required)
+#   delete_navigation   - Delete a navigation (--id required)
+#
+#   get_global          - Get global by ID or handle (--id required)
+#   create_global       - Create a global (--handle, --title required)
+#   update_global       - Update a global (--id required)
+#   delete_global       - Delete a global (--id required)
+#
+#   # WordPress import tools
+#   parse_wordpress     - Parse WordPress XML export (--file required, --type optional)
+#
+#   # Asset tools
+#   download_remote_asset - Download asset from URL (--url required)
+#   extract_asset_urls    - Extract asset URLs from HTML (--html or --file required)
+
+require_relative "../airogel_cms_client"
+require "json"
+require "yaml"
+require "sequel"
+require "securerandom"
+require_relative "../db/schema"
+
+ACTIONS = %w[
+  download_theme
+  download_database
+  download_templates
+  download_assets
+  upload_theme
+  upload_templates
+  upload_assets
+  generate_liquid_docs
+  list_accounts
+  list_templates
+  list_assets
+  list_collections
+  get_collection
+  create_collection
+  update_collection
+  delete_collection
+  list_entries
+  get_entry
+  create_entry
+  update_entry
+  delete_entry
+  list_blueprints
+  get_blueprint
+  create_blueprint
+  update_blueprint
+  delete_blueprint
+  list_navigations
+  get_navigation
+  create_navigation
+  update_navigation
+  delete_navigation
+  list_navigation_items
+  create_navigation_item
+  update_navigation_item
+  delete_navigation_item
+  list_globals
+  get_global
+  create_global
+  update_global
+  delete_global
+  parse_wordpress
+  download_remote_asset
+  extract_asset_urls
+].freeze
+
+# Actions that output JSON (for LLM consumption)
+JSON_OUTPUT_ACTIONS = %w[
+  list_collections
+  get_collection
+  create_collection
+  update_collection
+  delete_collection
+  list_navigation_items
+  create_navigation_item
+  update_navigation_item
+  delete_navigation_item
+  list_entries
+  get_entry
+  create_entry
+  update_entry
+  delete_entry
+  list_blueprints
+  get_blueprint
+  create_blueprint
+  update_blueprint
+  delete_blueprint
+  list_navigations
+  get_navigation
+  create_navigation
+  update_navigation
+  delete_navigation
+  list_globals
+  get_global
+  create_global
+  update_global
+  delete_global
+  parse_wordpress
+  download_remote_asset
+  extract_asset_urls
+].freeze
+
+def print_usage
+  puts "Usage: bin/airogelcms <theme_name> <action> [options]"
+  puts ""
+  puts "Theme Operations:"
+  puts "  download_theme      - Download entire theme (database + templates + assets)"
+  puts "  download_database   - Download just database.yml"
+  puts "  download_templates  - Download just templates"
+  puts "  download_assets     - Download just assets"
+  puts "  upload_theme        - Upload entire theme (templates + assets)"
+  puts "  upload_templates    - Upload just templates"
+  puts "  upload_assets       - Upload just assets"
+  puts "  generate_liquid_docs - Generate liquid_tags.md reference from local database"
+  puts ""
+  puts "List Operations:"
+  puts "  list_accounts       - List available CMS accounts"
+  puts "  list_templates      - List templates for the account"
+  puts "  list_assets         - List assets for the account"
+  puts "  list_collections    - List collections"
+  puts "  list_entries        - List entries (--collection required)"
+  puts "  list_blueprints     - List blueprints"
+  puts "  list_navigations    - List navigations"
+  puts "  list_globals        - List globals"
+  puts ""
+  puts "Collection CRUD:"
+  puts "  get_collection      - Get collection (--id required)"
+  puts "  create_collection   - Create collection (--name, --handle required)"
+  puts "  update_collection   - Update collection (--id required)"
+  puts "  delete_collection   - Delete collection (--id required)"
+  puts ""
+  puts "Entry CRUD:"
+  puts "  get_entry           - Get entry (--collection, --id required)"
+  puts "  create_entry        - Create entry (--collection required)"
+  puts "  update_entry        - Update entry (--collection, --id required)"
+  puts "  delete_entry        - Delete entry (--collection, --id required)"
+  puts ""
+  puts "Blueprint CRUD:"
+  puts "  get_blueprint       - Get blueprint (--id required)"
+  puts "  create_blueprint    - Create blueprint (--handle, --title, --fields required)"
+  puts "  update_blueprint    - Update blueprint (--id required)"
+  puts "  delete_blueprint    - Delete blueprint (--id required)"
+  puts ""
+  puts "Navigation CRUD:"
+  puts "  get_navigation      - Get navigation (--id required)"
+  puts "  create_navigation   - Create navigation (--handle, --title required)"
+  puts "  update_navigation   - Update navigation (--id required)"
+  puts "  delete_navigation   - Delete navigation (--id required)"
+  puts ""
+  puts "Global CRUD:"
+  puts "  get_global          - Get global (--id required)"
+  puts "  create_global       - Create global (--handle, --title required)"
+  puts "  update_global       - Update global (--id required)"
+  puts "  delete_global       - Delete global (--id required)"
+  puts ""
+  puts "WordPress Import:"
+  puts "  parse_wordpress     - Parse WordPress XML (--file required, --type optional)"
+  puts ""
+  puts "Asset Tools:"
+  puts "  download_remote_asset - Download remote asset (--url required)"
+  puts "  extract_asset_urls    - Extract URLs from HTML (--html or --file required)"
+  puts ""
+  puts "Options:"
+  puts "  --key=value         Pass options as key=value pairs"
+  puts "  --json              Force JSON output"
+  puts ""
+  puts "Examples:"
+  puts "  bin/airogelcms jbsite download_theme"
+  puts "  bin/airogelcms jbsite list_collections"
+  puts '  bin/airogelcms jbsite create_collection --name="Blog Posts" --handle=posts'
+  puts '  bin/airogelcms jbsite create_entry --collection=posts --handle=my-post --title="My Post"'
+  puts "  bin/airogelcms jbsite parse_wordpress --file=export.xml --type=posts"
+end
+
+def parse_options(args)
+  options = {}
+  args.each do |arg|
+    if arg.start_with?("--")
+      key, value = arg[2..].split("=", 2)
+      key = key.tr("-", "_").to_sym
+
+      # Handle JSON arrays/objects
+      if value&.start_with?("[", "{")
+        begin
+          value = JSON.parse(value)
+        rescue JSON::ParserError
+          # Keep as string if not valid JSON
+        end
+      # Handle booleans
+      elsif value == "true"
+        value = true
+      elsif value == "false"
+        value = false
+      # Handle nil/empty
+      elsif value.nil?
+        value = true
+      end
+
+      options[key] = value
+    end
+  end
+  options
+end
+
+def output_json(data)
+  puts JSON.pretty_generate(data)
+end
+
+def output_result(success:, data: nil, message: nil, error: nil, details: nil)
+  result = { success: success }
+  result[:data] = data if data
+  result[:message] = message if message
+  result[:error] = error if error
+  result[:details] = details if details
+  output_json(result)
+end
+
+def handle_api_response(response, success_message = nil)
+  if response.is_a?(Hash) && (response["error"] || response["errors"])
+    output_result(
+      success: false,
+      error: response["error"] || "Validation failed",
+      details: response["errors"]
+    )
+  else
+    output_result(
+      success: true,
+      data: response,
+      message: success_message
+    )
+  end
+end
+
+def import_yaml_to_sqlite(theme_path)
+  yaml_path = File.join(theme_path, "database.yml")
+  sqlite_path = File.join(theme_path, "database.sqlite3")
+
+  unless File.exist?(yaml_path)
+    puts "No database.yml found, skipping SQLite import."
+    return
+  end
+
+  puts
+  puts "Importing database.yml into SQLite..."
+
+  raw = if YAML.respond_to?(:unsafe_load_file)
+    YAML.unsafe_load_file(yaml_path)
+  else
+    YAML.load_file(yaml_path)
+  end
+
+  db = Sequel.sqlite(sqlite_path)
+  Schema.create!(db)
+
+  # Clear existing data
+  [ :content_paths, :entries, :collections, :globals, :navigations, :navigation_items, :forms ].each do |table|
+    db[table].delete
+  end
+
+  skip_keys = %w[content_paths navigation forms site site_settings]
+
+  # Content paths
+  if raw["content_paths"]
+    raw["content_paths"].each do |path, config|
+      is_index = config["content"] == "_index"
+      db[:content_paths].insert(
+        path: path,
+        collection_handle: config["content_key"],
+        entry_handle: is_index ? nil : config["content"],
+        template_handle: config["template"],
+        layout_handle: config["layout"] || "theme",
+        is_index: is_index
+      )
+    end
+    puts "  Imported #{raw["content_paths"].size} content paths"
+  end
+
+  # Globals
+  %w[site site_settings].each do |key|
+    next unless raw[key]
+    data = raw[key]
+    if data.is_a?(Hash)
+      db[:globals].insert(handle: key, name: data["title"] || key.tr("_", " ").capitalize, data: JSON.dump(data))
+      puts "  Imported global: #{key}"
+    end
+  end
+
+  # Navigations
+  raw["navigation"]&.each do |nav_handle, items|
+    db[:navigations].insert(handle: nav_handle, title: nav_handle.capitalize)
+    next unless items.is_a?(Array)
+    items.each_with_index do |item, idx|
+      db[:navigation_items].insert(
+        navigation_handle: nav_handle, title: item["title"], url: item["url"], position: idx
+      )
+    end
+    puts "  Imported navigation: #{nav_handle} (#{items.size} items)"
+  end
+
+  # Forms
+  raw["forms"]&.each do |form_handle, config|
+    db[:forms].insert(
+      handle: form_handle,
+      title: config["title"] || form_handle.tr("_", " ").capitalize,
+      collection_handle: config["collection"] || form_handle,
+      blueprint_handle: config["blueprint"],
+      honeypot_enabled: config["honeypot_enabled"] || false,
+      redirect_url: config["redirect_url"] || "",
+      success_message: config["success_message"] || "",
+      fields: JSON.dump(config["fields"] || [])
+    )
+    puts "  Imported form: #{form_handle}"
+  end
+
+  # Collections and entries
+  raw.each do |key, values|
+    next if skip_keys.include?(key)
+    next unless values.is_a?(Array) && values.first.is_a?(Hash) && values.first.key?("handle")
+
+    db[:collections].insert_conflict(:replace).insert(handle: key, name: key.tr("_", " ").capitalize, routing: "#{key}/:handle")
+
+    values.each do |entry|
+      core_keys = %w[id title handle content_path published_at position]
+      data = {}
+
+      entry.each do |field_key, field_value|
+        next if core_keys.include?(field_key)
+        if field_value.is_a?(Array) && field_value.first.is_a?(Hash) && field_value.first.key?("handle")
+          data[field_key] = field_value.map do |ref|
+            col = infer_collection_from_ref(ref)
+            col ? { "handle" => ref["handle"], "collection" => col } : ref
+          end
+        elsif field_value.is_a?(Hash) && field_value.key?("handle") && !field_value.key?("body")
+          col = infer_collection_from_ref(field_value)
+          data[field_key] = col ? { "handle" => field_value["handle"], "collection" => col } : field_value
+        else
+          data[field_key] = field_value
+        end
+      end
+
+      db[:entries].insert(
+        prefix_id: entry["id"] || "cnety_#{SecureRandom.hex(12)}",
+        collection_handle: key, handle: entry["handle"], title: entry["title"],
+        published: entry.fetch("published", true), published_at: entry["published_at"],
+        position: entry["position"] || 0, data: JSON.dump(data)
+      )
+    end
+    puts "  Imported collection: #{key} (#{values.size} entries)"
+  end
+
+  db.disconnect
+  puts "SQLite database updated: #{sqlite_path}"
+end
+
+def infer_collection_from_ref(ref)
+  cp = ref["content_path"]
+  return nil unless cp
+  case cp
+  when %r{^/tag/} then "tag"
+  when %r{^/blog/} then "post"
+  when %r{^/news/} then "news"
+  when %r{^/testimonial/} then "testimonial"
+  when %r{^/team/} then "team"
+  when %r{^/properties/} then "properties"
+  when %r{^/service/} then "service"
+  when %r{^/neighborhoods/} then "neighborhood"
+  when %r{^/stats/} then "stats"
+  when %r{^/[^/]+$} then "page"
+  end
+end
+
+# Field type inference helpers for generate_liquid_docs
+FIELD_TYPE_DESCRIPTIONS = {
+  "image" => "String (URL)",
+  "video" => "Object (url, video_id, thumbnail)",
+  "gallery" => "Array of image/video objects",
+  "entity_single" => "Object (handle, collection, title, ...)",
+  "entity_array" => "Array of entry objects",
+  "toggle" => "Boolean",
+  "list" => "Array of strings",
+  "dictionary" => "Object (key/value pairs)",
+  "rich_text" => "String (HTML)",
+  "text" => "String",
+  "unknown" => "Mixed"
+}.freeze
+
+def infer_field_type(value)
+  case value
+  when TrueClass, FalseClass
+    "toggle"
+  when Array
+    if value.empty?
+      "list"
+    elsif value.first.is_a?(Hash) && (value.first.key?("handle") || value.first.key?("collection"))
+      "entity_array"
+    elsif value.first.is_a?(Hash) && (value.first.key?("type") || value.first.key?("url"))
+      "gallery"
+    elsif value.first.is_a?(String)
+      "list"
+    else
+      "list"
+    end
+  when Hash
+    if value.key?("handle") && value.key?("collection")
+      "entity_single"
+    elsif value.key?("url") && value.key?("video_id")
+      "video"
+    elsif value.key?("template")
+      "template"
+    else
+      "dictionary"
+    end
+  when String
+    if value.match?(/<[a-z][\s>]/i)
+      "rich_text"
+    elsif value.match?(%r{^/|^https?://}) && value.match?(/\.(jpg|jpeg|png|gif|webp|svg)$/i)
+      "image"
+    else
+      "text"
+    end
+  else
+    "unknown"
+  end
+end
+
+def liquid_access_example(collection_handle, field_name, field_type)
+  base = "{{ #{collection_handle}.#{field_name} }}"
+  case field_type
+  when "entity_array"
+    "{% for item in #{collection_handle}.#{field_name} %}{{ item.title }}{% endfor %}"
+  when "entity_single"
+    "{{ #{collection_handle}.#{field_name}.title }}"
+  when "gallery"
+    "{% for item in #{collection_handle}.#{field_name} %}{{ item.url | image_tag: item.alt }}{% endfor %}"
+  when "video"
+    "{{ #{collection_handle}.#{field_name}.url | video_player }}"
+  when "image"
+    "{{ #{collection_handle}.#{field_name} | image_tag: 'Alt text' }}"
+  when "toggle"
+    "{% if #{collection_handle}.#{field_name} %}...{% endif %}"
+  when "list"
+    "{% for item in #{collection_handle}.#{field_name} %}{{ item }}{% endfor %}"
+  when "dictionary"
+    "{{ #{collection_handle}.#{field_name}.key_name }}"
+  else
+    base
+  end
+end
+
+def generate_liquid_docs(theme_path)
+  sqlite_path = File.join(theme_path, "database.sqlite3")
+
+  unless File.exist?(sqlite_path)
+    puts "No database.sqlite3 found at #{sqlite_path}. Run download_database first."
+    return
+  end
+
+  puts
+  puts "Generating liquid_tags.md from #{sqlite_path}..."
+
+  db = Sequel.sqlite(sqlite_path)
+
+  docs_dir = File.join(theme_path, "docs")
+  FileUtils.mkdir_p(docs_dir)
+  output_path = File.join(docs_dir, "liquid_tags.md")
+
+  lines = []
+  lines << "# Liquid Tags Reference"
+  lines << ""
+  lines << "Auto-generated from `database.sqlite3`. Regenerate with:"
+  lines << ""
+  lines << "```bash"
+  lines << "bin/airogelcms {THEME} generate_liquid_docs"
+  lines << "```"
+  lines << ""
+  lines << "> This file is the canonical Liquid variable reference for this theme."
+  lines << "> Use it to look up field names, collection handles, global keys, and navigation handles."
+  lines << ""
+  lines << "---"
+  lines << ""
+
+  # ── Global variables (always available) ──────────────────────────────────
+  lines << "## Global Variables (available on every page)"
+  lines << ""
+  lines << "| Variable | Description |"
+  lines << "|----------|-------------|"
+  lines << "| `{{ current_path }}` | Current URL path, e.g. `/blog/my-post` |"
+  lines << "| `{{ page }}` | Current page number (index/paginated pages only) |"
+  lines << "| `{{ navigation }}` | Navigation drop – access menus via `{{ navigation.HANDLE }}` |"
+  lines << "| `{{ content_for_layout }}` | Rendered content template (layout only) |"
+  lines << "| `{{ content_for_header }}` | SEO meta tags + CMS widget CSS/JS (layout `<head>`) |"
+  lines << "| `{{ forms }}` | Form definitions hash |"
+  lines << ""
+
+  # ── Site globals ─────────────────────────────────────────────────────────
+  globals = db[:globals].all
+  if globals.any?
+    lines << "## Site Globals"
+    lines << ""
+    lines << "Each global is available as a top-level Liquid variable using its handle."
+    lines << ""
+
+    globals.each do |global|
+      handle = global[:handle]
+      name = global[:name]
+      data = begin; JSON.parse(global[:data]); rescue; {}; end
+
+      lines << "### `{{ #{handle} }}` — #{name}"
+      lines << ""
+
+      if data.any?
+        lines << "| Field | Example Access | Type |"
+        lines << "|-------|----------------|------|"
+
+        data.each do |key, value|
+          type = infer_field_type(value)
+          example = "{{ #{handle}.#{key} }}"
+          type_desc = FIELD_TYPE_DESCRIPTIONS.fetch(type, type)
+          lines << "| `#{key}` | `#{example}` | #{type_desc} |"
+        end
+      else
+        lines << "_No fields found in this global._"
+      end
+
+      lines << ""
+    end
+  end
+
+  # ── Navigations ───────────────────────────────────────────────────────────
+  navigations = db[:navigations].all
+  if navigations.any?
+    lines << "## Navigations"
+    lines << ""
+    lines << "Access navigation menus via `{{ navigation.HANDLE }}`."
+    lines << ""
+    lines << "| Handle | Title | Access Example |"
+    lines << "|--------|-------|----------------|"
+
+    navigations.each do |nav|
+      h = nav[:handle]
+      lines << "| `#{h}` | #{nav[:title]} | `{% for item in navigation.#{h} %}{{ item.title }}{% endfor %}` |"
+    end
+
+    lines << ""
+    lines << "**Navigation item fields:** `item.title`, `item.url`"
+    lines << ""
+  end
+
+  # ── Collections & their fields ────────────────────────────────────────────
+  lines << "## Collections"
+  lines << ""
+  lines << "Collection entries are accessed via the collection handle as a Liquid variable."
+  lines << "On **detail pages**, the variable holds the current entry."
+  lines << "On **index pages**, use `HANDLE.entries` for the full list."
+  lines << ""
+
+  collections = db[:collections].all
+  collections.each do |collection|
+    handle = collection[:handle]
+    name = collection[:name]
+    routing = collection[:routing] || "#{handle}/:handle"
+    index_routing = collection[:index_routing]
+
+    lines << "### Collection: `#{handle}` — #{name}"
+    lines << ""
+    lines << "| Property | Value |"
+    lines << "|----------|-------|"
+    lines << "| Handle | `#{handle}` |"
+    lines << "| Routing | `#{routing}` |"
+    lines << "| Index routing | #{index_routing ? "`#{index_routing}`" : "_none_"} |"
+    lines << ""
+
+    # Core entry fields (always present)
+    lines << "#### Built-in Fields (all entries)"
+    lines << ""
+    lines << "| Field | Example Access | Description |"
+    lines << "|-------|----------------|-------------|"
+    lines << "| `title` | `{{ #{handle}.title }}` | Entry title |"
+    lines << "| `handle` | `{{ #{handle}.handle }}` | URL slug |"
+    lines << "| `published_at` | `{{ #{handle}.published_at }}` | Publication date |"
+    lines << "| `content_path` | `{{ #{handle}.content_path }}` | Full URL path |"
+    lines << ""
+
+    # Discover blueprint fields from entry data
+    entries = db[:entries].where(collection_handle: handle).all
+    field_types = {}
+
+    entries.each do |entry|
+      data = begin; JSON.parse(entry[:data]); rescue; {}; end
+      data.each do |key, value|
+        # Skip SEO/meta fields we'll document separately
+        next if %w[seo_title seo_description og_image canonical_url noindex og_type].include?(key)
+        existing = field_types[key]
+        inferred = infer_field_type(value)
+        # Keep more specific type if we already have one
+        field_types[key] = inferred if existing.nil? || existing == "unknown"
+      end
+    end
+
+    # SEO fields discovered
+    seo_fields = {}
+    entries.each do |entry|
+      data = begin; JSON.parse(entry[:data]); rescue; {}; end
+      %w[seo_title seo_description og_image canonical_url noindex og_type].each do |key|
+        seo_fields[key] = infer_field_type(data[key]) if data.key?(key) && !seo_fields.key?(key)
+      end
+    end
+
+    if field_types.any?
+      lines << "#### Blueprint Fields"
+      lines << ""
+      lines << "| Field | Example Access | Type | Notes |"
+      lines << "|-------|----------------|------|-------|"
+
+      field_types.each do |field_name, field_type|
+        example = liquid_access_example(handle, field_name, field_type)
+        type_desc = FIELD_TYPE_DESCRIPTIONS.fetch(field_type, field_type)
+        notes = case field_type
+        when "entity_array", "entity_single" then "Resolved entry reference"
+        when "rich_text" then "Output raw HTML with `{{ ... }}`"
+        when "image" then "Use `| image_tag:` filter"
+        when "video" then "Use `| video_player` filter"
+        when "gallery" then "Loop with `for item in ...`"
+        else ""
+        end
+        lines << "| `#{field_name}` | `#{example}` | #{type_desc} | #{notes} |"
+      end
+    else
+      lines << "_No entries found – blueprint fields will appear here after content is added._"
+    end
+
+    lines << ""
+
+    # Index page usage
+    if index_routing
+      lines << "#### Index Page Usage (`/#{index_routing}`)"
+      lines << ""
+      lines << "```liquid"
+      lines << "{% paginate #{handle}.entries by 10 %}"
+      lines << "  {% for entry in paginate.items %}"
+      lines << "    <a href=\"{{ entry.content_path }}\">{{ entry.title }}</a>"
+      lines << "  {% endfor %}"
+      lines << "  {{ paginate.previous_url }} {{ paginate.next_url }}"
+      lines << "{% endpaginate %}"
+      lines << "```"
+      lines << ""
+    end
+
+    # SEO fields (if present)
+    if seo_fields.any?
+      lines << "#### SEO Fields"
+      lines << ""
+      lines << "| Field | Example Access |"
+      lines << "|-------|----------------|"
+      seo_fields.each_key do |key|
+        lines << "| `#{key}` | `{{ #{handle}.#{key} }}` |"
+      end
+      lines << ""
+    end
+  end
+
+  # ── Forms ─────────────────────────────────────────────────────────────────
+  forms = db[:forms].all
+  if forms.any?
+    lines << "## Forms"
+    lines << ""
+    lines << "Use `{% form_for form: \"HANDLE\" %}...{% endform_for %}` in templates."
+    lines << ""
+
+    forms.each do |form|
+      fhandle = form[:handle]
+      fields = begin; JSON.parse(form[:fields]); rescue; []; end
+
+      lines << "### Form: `#{fhandle}` — #{form[:title]}"
+      lines << ""
+      lines << "```liquid"
+      lines << "{% form_for form: \"#{fhandle}\" %}"
+
+      if fields.any?
+        fields.each do |f|
+          fname = f.is_a?(Hash) ? (f["handle"] || f["name"]) : f.to_s
+          lines << "  <input type=\"text\" name=\"fields[#{fname}]\">"
+        end
+      else
+        lines << "  <input type=\"text\" name=\"fields[FIELD_HANDLE]\">"
+      end
+
+      lines << "  <button type=\"submit\" data-collection-form-target=\"submit\">Submit</button>"
+      lines << "{% endform_for %}"
+      lines << "```"
+      lines << ""
+
+      lines << "**Collection:** `#{form[:collection_handle]}`"
+      lines << ""
+      if fields.any?
+        lines << "**Fields:** " + fields.map { |f|
+          fname = f.is_a?(Hash) ? (f["handle"] || f["name"]) : f.to_s
+          "`#{fname}`"
+        }.join(", ")
+        lines << ""
+      end
+    end
+  end
+
+  # ── Custom tags & filters cheat sheet ────────────────────────────────────
+  lines << "## Custom Tags"
+  lines << ""
+  lines << "| Tag | Usage |"
+  lines << "|-----|-------|"
+  lines << "| `form_for` | `{% form_for form: \"handle\" %}...{% endform_for %}` |"
+  lines << "| `paginate` | `{% paginate COLLECTION.entries by N %}...{% endpaginate %}` |"
+  lines << "| `render` | `{% render 'partial_name', var: value %}` |"
+  lines << "| `cms_scripts` | `{% cms_scripts %}` — loads the CMS chat widget (before `</body>`) |"
+  lines << "| `locale` | `{% locale %}` — outputs locale string, e.g. `en-us` |"
+  lines << ""
+  lines << "## Custom Filters"
+  lines << ""
+  lines << "| Filter | Example | Output |"
+  lines << "|--------|---------|--------|"
+  lines << "| `asset_url` | `{{ 'application.css' \\| asset_url }}` | `/application.css` |"
+  lines << "| `image_tag` | `{{ url \\| image_tag: 'Alt', 'css-class' }}` | `<img src=\"...\" alt=\"...\">` |"
+  lines << "| `script_tag` | `{{ url \\| script_tag }}` | `<script src=\"...\">` |"
+  lines << "| `stylesheet_tag` | `{{ url \\| stylesheet_tag }}` | `<link href=\"...\" rel=\"stylesheet\">` |"
+  lines << "| `video_player` | `{{ youtube_url \\| video_player }}` | `<iframe>` embed |"
+  lines << ""
+
+  db.disconnect
+
+  File.write(output_path, lines.join("\n") + "\n")
+  puts "Generated: #{output_path}"
+  output_path
+end
+
+def main
+  if ARGV.length < 2
+    print_usage
+    exit 1
+  end
+
+  theme_name = ARGV[0]
+  action = ARGV[1]
+  option_args = ARGV[2..]
+
+  # Validate action
+  unless ACTIONS.include?(action)
+    puts "Error: Unknown action '#{action}'"
+    puts "Valid actions: #{ACTIONS.join(", ")}"
+    exit 1
+  end
+
+  # Build theme path
+  theme_path = File.join(Dir.pwd, "themes", theme_name)
+
+  unless Dir.exist?(theme_path)
+    puts "Error: Theme directory not found: #{theme_path}"
+    exit 1
+  end
+
+  # Parse options from remaining arguments
+  options = parse_options(option_args)
+
+  # Load environment from theme
+  env = AirogelCmsClient.load_theme_env(theme_path)
+  unless env
+    puts "Error: Could not load .env file from theme directory"
+    puts "Make sure #{theme_path}/.env exists with AIROGEL_API_URL, AIROGEL_ACCOUNT_ID, and AIROGEL_API_KEY"
+    exit 1
+  end
+
+  # Create client
+  client = AirogelCmsClient.new(env[:api_url], env[:api_key])
+  account_id = env[:account_id]
+
+  # Execute action
+  case action
+  # ============================================================
+  # Theme operations (existing)
+  # ============================================================
+  when "download_theme"
+    client.download_theme(account_id, theme_path)
+    import_yaml_to_sqlite(theme_path)
+    generate_liquid_docs(theme_path)
+
+  when "download_database"
+    database_path = File.join(theme_path, "database.yml")
+    client.download_database(account_id, database_path)
+    import_yaml_to_sqlite(theme_path)
+    generate_liquid_docs(theme_path)
+
+  when "download_templates"
+    templates_dir = File.join(theme_path, "templates")
+    client.download_all_templates(account_id, templates_dir)
+
+  when "download_assets"
+    assets_dir = File.join(theme_path, "assets")
+    client.download_all_assets(account_id, assets_dir)
+
+  when "upload_theme"
+    client.upload_theme(account_id, theme_path)
+
+  when "upload_templates"
+    templates_dir = File.join(theme_path, "templates")
+    client.upload_templates(account_id, templates_dir)
+
+  when "upload_assets"
+    assets_dir = File.join(theme_path, "assets")
+    client.upload_assets(account_id, assets_dir)
+
+  when "generate_liquid_docs"
+    import_yaml_to_sqlite(theme_path) unless File.exist?(File.join(theme_path, "database.sqlite3"))
+    path = generate_liquid_docs(theme_path)
+    puts "Liquid tags reference written to: #{path}" if path
+
+  when "list_accounts"
+    accounts = client.get_accounts
+    if accounts.is_a?(Hash) && accounts["error"]
+      puts "Error: #{accounts["error"]}"
+    else
+      puts "Available accounts:"
+      accounts.each do |account|
+        puts "  - #{account["id"]}: #{account["name"]}"
+      end
+    end
+
+  when "list_templates"
+    templates = client.get_templates(account_id)
+    if templates.is_a?(Hash) && templates["error"]
+      puts "Error: #{templates["error"]}"
+    else
+      templates_list = templates.is_a?(Array) ? templates : (templates["templates"] || [])
+      puts "Templates for account #{account_id}:"
+      templates_list.each do |template|
+        puts "  - #{template["handle"]} (#{template["id"]})"
+      end
+      puts "Total: #{templates_list.size} templates"
+    end
+
+  when "list_assets"
+    assets = client.get_assets(account_id)
+    if assets.is_a?(Hash) && assets["error"]
+      puts "Error: #{assets["error"]}"
+    else
+      assets_list = assets.is_a?(Array) ? assets : (assets["assets"] || [])
+      puts "Assets for account #{account_id}:"
+      assets_list.each do |asset|
+        path = asset["path"].to_s.empty? ? "" : "#{asset["path"]}/"
+        puts "  - #{path}#{asset["filename"]} (#{asset["id"]})"
+      end
+      puts "Total: #{assets_list.size} assets"
+    end
+
+  # ============================================================
+  # Collections CRUD
+  # ============================================================
+  when "list_collections"
+    page = options[:page] || 1
+    per_page = options[:per_page] || 25
+    response = client.get_collections(account_id, page: page, per_page: per_page)
+    handle_api_response(response)
+
+  when "get_collection"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.get_collection(account_id, options[:id])
+    handle_api_response(response)
+
+  when "create_collection"
+    unless options[:name] && options[:handle]
+      output_result(success: false, error: "Missing required options: --name, --handle")
+      exit 1
+    end
+    # Extract known options, pass rest as additional options
+    name = options.delete(:name)
+    handle = options.delete(:handle)
+    response = client.create_collection(account_id, name: name, handle: handle, **options)
+    handle_api_response(response, "Collection created successfully")
+
+  when "update_collection"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    id = options.delete(:id)
+    response = client.update_collection(account_id, id, **options)
+    handle_api_response(response, "Collection updated successfully")
+
+  when "delete_collection"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.delete_collection(account_id, options[:id])
+    handle_api_response(response, "Collection deleted successfully")
+
+  # ============================================================
+  # Entries CRUD
+  # ============================================================
+  when "list_entries"
+    unless options[:collection]
+      output_result(success: false, error: "Missing required option: --collection")
+      exit 1
+    end
+    page = options[:page] || 1
+    per_page = options[:per_page] || 25
+    response = client.get_entries(account_id, options[:collection], page: page, per_page: per_page)
+    handle_api_response(response)
+
+  when "get_entry"
+    unless options[:collection] && options[:id]
+      output_result(success: false, error: "Missing required options: --collection, --id")
+      exit 1
+    end
+    response = client.get_entry(account_id, options[:collection], options[:id])
+    handle_api_response(response)
+
+  when "create_entry"
+    unless options[:collection]
+      output_result(success: false, error: "Missing required option: --collection")
+      exit 1
+    end
+    collection = options.delete(:collection)
+    response = client.create_entry(account_id, collection, **options)
+    handle_api_response(response, "Entry created successfully")
+
+  when "update_entry"
+    unless options[:collection] && options[:id]
+      output_result(success: false, error: "Missing required options: --collection, --id")
+      exit 1
+    end
+    collection = options.delete(:collection)
+    id = options.delete(:id)
+    response = client.update_entry(account_id, collection, id, **options)
+    handle_api_response(response, "Entry updated successfully")
+
+  when "delete_entry"
+    unless options[:collection] && options[:id]
+      output_result(success: false, error: "Missing required options: --collection, --id")
+      exit 1
+    end
+    response = client.delete_entry(account_id, options[:collection], options[:id])
+    handle_api_response(response, "Entry deleted successfully")
+
+  # ============================================================
+  # Blueprints CRUD
+  # ============================================================
+  when "list_blueprints"
+    page = options[:page] || 1
+    per_page = options[:per_page] || 25
+    response = client.get_blueprints(account_id, page: page, per_page: per_page)
+    handle_api_response(response)
+
+  when "get_blueprint"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.get_blueprint(account_id, options[:id])
+    handle_api_response(response)
+
+  when "create_blueprint"
+    unless options[:handle] && options[:title]
+      output_result(success: false, error: "Missing required options: --handle, --title")
+      exit 1
+    end
+    handle = options.delete(:handle)
+    title = options.delete(:title)
+    fields = options.delete(:fields) || []
+    response = client.create_blueprint(account_id, handle: handle, title: title, fields: fields)
+    handle_api_response(response, "Blueprint created successfully")
+
+  when "update_blueprint"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    id = options.delete(:id)
+    response = client.update_blueprint(account_id, id, **options)
+    handle_api_response(response, "Blueprint updated successfully")
+
+  when "delete_blueprint"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.delete_blueprint(account_id, options[:id])
+    handle_api_response(response, "Blueprint deleted successfully")
+
+  # ============================================================
+  # Navigations CRUD
+  # ============================================================
+  when "list_navigations"
+    page = options[:page] || 1
+    per_page = options[:per_page] || 25
+    response = client.get_navigations(account_id, page: page, per_page: per_page)
+    handle_api_response(response)
+
+  when "get_navigation"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.get_navigation(account_id, options[:id])
+    handle_api_response(response)
+
+  when "create_navigation"
+    unless options[:handle] && options[:title]
+      output_result(success: false, error: "Missing required options: --handle, --title")
+      exit 1
+    end
+    handle = options.delete(:handle)
+    title = options.delete(:title)
+    items = options.delete(:items) || []
+    response = client.create_navigation(account_id, handle: handle, title: title, items: items)
+    handle_api_response(response, "Navigation created successfully")
+
+  when "update_navigation"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    id = options.delete(:id)
+    response = client.update_navigation(account_id, id, **options)
+    handle_api_response(response, "Navigation updated successfully")
+
+  when "delete_navigation"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.delete_navigation(account_id, options[:id])
+    handle_api_response(response, "Navigation deleted successfully")
+
+  # ============================================================
+  # Navigation Items CRUD
+  # ============================================================
+  when "list_navigation_items"
+    unless options[:navigation]
+      output_result(success: false, error: "Missing required option: --navigation")
+      exit 1
+    end
+    response = client.get_navigation_items(account_id, options[:navigation])
+    handle_api_response(response)
+
+  when "create_navigation_item"
+    unless options[:navigation] && options[:title]
+      output_result(success: false, error: "Missing required options: --navigation, --title")
+      exit 1
+    end
+    navigation = options.delete(:navigation)
+    response = client.create_navigation_item(account_id, navigation, **options)
+    handle_api_response(response, "Navigation item created successfully")
+
+  when "update_navigation_item"
+    unless options[:navigation] && options[:id]
+      output_result(success: false, error: "Missing required options: --navigation, --id")
+      exit 1
+    end
+    navigation = options.delete(:navigation)
+    id = options.delete(:id)
+    response = client.update_navigation_item(account_id, navigation, id, **options)
+    handle_api_response(response, "Navigation item updated successfully")
+
+  when "delete_navigation_item"
+    unless options[:navigation] && options[:id]
+      output_result(success: false, error: "Missing required options: --navigation, --id")
+      exit 1
+    end
+    response = client.delete_navigation_item(account_id, options[:navigation], options[:id])
+    handle_api_response(response, "Navigation item deleted successfully")
+
+  # ============================================================
+  # Globals CRUD
+  # ============================================================
+  when "list_globals"
+    page = options[:page] || 1
+    per_page = options[:per_page] || 25
+    response = client.get_globals(account_id, page: page, per_page: per_page)
+    handle_api_response(response)
+
+  when "get_global"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.get_global(account_id, options[:id])
+    handle_api_response(response)
+
+  when "create_global"
+    unless options[:handle] && options[:title]
+      output_result(success: false, error: "Missing required options: --handle, --title")
+      exit 1
+    end
+    handle = options.delete(:handle)
+    title = options.delete(:title)
+    response = client.create_global(account_id, handle: handle, title: title, **options)
+    handle_api_response(response, "Global created successfully")
+
+  when "update_global"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    id = options.delete(:id)
+    response = client.update_global(account_id, id, **options)
+    handle_api_response(response, "Global updated successfully")
+
+  when "delete_global"
+    unless options[:id]
+      output_result(success: false, error: "Missing required option: --id")
+      exit 1
+    end
+    response = client.delete_global(account_id, options[:id])
+    handle_api_response(response, "Global deleted successfully")
+
+  # ============================================================
+  # WordPress Import
+  # ============================================================
+  when "parse_wordpress"
+    unless options[:file]
+      output_result(success: false, error: "Missing required option: --file")
+      exit 1
+    end
+
+    file_path = options[:file]
+    # Handle relative paths
+    file_path = File.join(theme_path, file_path) unless file_path.start_with?("/")
+
+    unless File.exist?(file_path)
+      output_result(success: false, error: "File not found: #{file_path}")
+      exit 1
+    end
+
+    require_relative "../lib/wordpress_parser"
+
+    type = (options[:type] || "all").to_sym
+    parser = WordPressParser.new(file_path)
+    result = parser.parse(type: type)
+
+    # Add summary info
+    summary = {}
+    summary[:posts_count] = result[:posts]&.size if result[:posts]
+    summary[:pages_count] = result[:pages]&.size if result[:pages]
+    summary[:attachments_count] = result[:attachments]&.size if result[:attachments]
+    summary[:categories_count] = result[:categories]&.size if result[:categories]
+    summary[:tags_count] = result[:tags]&.size if result[:tags]
+    summary[:menus_count] = result[:menus]&.size if result[:menus]
+
+    output_result(
+      success: true,
+      data: result,
+      message: "Parsed WordPress export: #{summary.map { |k, v| "#{v} #{k.to_s.sub("_count", "")}" }.join(", ")}"
+    )
+
+  # ============================================================
+  # Asset Tools
+  # ============================================================
+  when "download_remote_asset"
+    unless options[:url]
+      output_result(success: false, error: "Missing required option: --url")
+      exit 1
+    end
+
+    require_relative "../lib/asset_downloader"
+
+    downloader = AssetDownloader.new(theme_path)
+    preserve_path = options[:preserve_path] != false
+    result = downloader.download(options[:url], preserve_path: preserve_path)
+
+    if result[:success]
+      output_result(success: true, data: result, message: "Asset downloaded successfully")
+    else
+      output_result(success: false, error: result[:error])
+    end
+
+  when "extract_asset_urls"
+    unless options[:html] || options[:file]
+      output_result(success: false, error: "Missing required option: --html or --file")
+      exit 1
+    end
+
+    require_relative "../lib/asset_downloader"
+
+    html = if options[:file]
+      file_path = options[:file]
+      file_path = File.join(theme_path, file_path) unless file_path.start_with?("/")
+      File.read(file_path)
+    else
+      options[:html]
+    end
+
+    urls = AssetDownloader.extract_urls(html)
+    output_result(success: true, data: { urls: urls, count: urls.size })
+
+  else
+    puts "Error: Unhandled action '#{action}'"
+    exit 1
+  end
+end
+
+main

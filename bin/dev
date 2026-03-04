@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+# Load theme env vars
+if [ -f .env_vars ]; then
+  export $(cat .env_vars | xargs)
+fi
+
+exec foreman start -f Procfile.dev "$@"
