@@ -5,6 +5,21 @@
 # Usage: bin/airogelcms <theme_name> <action> [options]
 #
 # Actions:
+#   # Account creation & subscription (no theme directory required)
+#   register            - Create new user + account + API token
+#                         (--name, --email, --password, --account_name required;
+#                          --api_url optional, defaults to https://api.airogelcms.com)
+#                         Outputs credentials to write into themes/<theme>/.env
+#   list_plans          - List available subscription plans
+#                         (--api_url and --api_key required, or use theme .env)
+#
+#   # Account & subscription management (requires theme .env with API token)
+#   create_account      - Create an additional account for the authenticated user
+#                         (--name required)
+#   subscription_checkout - Generate a Stripe Checkout URL to subscribe an account
+#                         (--plan required; --success_url, --cancel_url optional)
+#   subscription_status - Check whether the account has an active subscription
+#
 #   # Theme operations
 #   download_theme      - Download entire theme (database + templates + assets)
 #   download_database   - Download just database.yml
@@ -65,6 +80,11 @@ require "securerandom"
 require_relative "../db/schema"
 
 ACTIONS = %w[
+  register
+  list_plans
+  create_account
+  subscription_checkout
+  subscription_status
   download_theme
   download_database
   download_templates
@@ -112,6 +132,11 @@ ACTIONS = %w[
 
 # Actions that output JSON (for LLM consumption)
 JSON_OUTPUT_ACTIONS = %w[
+  register
+  list_plans
+  create_account
+  subscription_checkout
+  subscription_status
   list_collections
   get_collection
   create_collection
@@ -146,8 +171,29 @@ JSON_OUTPUT_ACTIONS = %w[
   extract_asset_urls
 ].freeze
 
+# Actions that do NOT require a theme directory or .env credentials.
+# They take --api_url directly (defaulting to https://api.airogelcms.com).
+NO_THEME_ACTIONS = %w[register].freeze
+
+# Actions that require an API token but NOT necessarily an account_id from
+# .env — the account_id is either in the response (register) or passed as
+# --account_id / inferred from the theme.
+NO_ACCOUNT_ACTIONS = %w[register list_plans create_account].freeze
+
 def print_usage
   puts "Usage: bin/airogelcms <theme_name> <action> [options]"
+  puts ""
+  puts "Account Creation & Subscription:"
+  puts "  register            - Create new user + account + API token (no .env needed)"
+  puts "                        --name, --email, --password, --account_name required"
+  puts "                        --api_url optional (default: https://api.airogelcms.com)"
+  puts "  list_plans          - List available subscription plans"
+  puts "                        --interval=month|year optional"
+  puts "  create_account      - Create an additional account (--name required)"
+  puts "  subscription_checkout - Get a Stripe Checkout URL to subscribe"
+  puts "                        --plan required (plan prefix ID from list_plans)"
+  puts "                        --success_url, --cancel_url optional"
+  puts "  subscription_status - Check whether the account has an active subscription"
   puts ""
   puts "Theme Operations:"
   puts "  download_theme      - Download entire theme (database + templates + assets)"
@@ -211,6 +257,11 @@ def print_usage
   puts "  --json              Force JSON output"
   puts ""
   puts "Examples:"
+  puts '  bin/airogelcms mysite register --name="Jane Doe" --email=jane@example.com \\'
+  puts '    --password=secret123 --account_name="Jane\'s Site"'
+  puts "  bin/airogelcms mysite list_plans"
+  puts "  bin/airogelcms mysite subscription_checkout --plan=plan_xxx"
+  puts "  bin/airogelcms mysite subscription_status"
   puts "  bin/airogelcms jbsite download_theme"
   puts "  bin/airogelcms jbsite list_collections"
   puts '  bin/airogelcms jbsite create_collection --name="Blog Posts" --handle=posts'
@@ -799,28 +850,151 @@ def main
   # Build theme path
   theme_path = File.join(Dir.pwd, "themes", theme_name)
 
-  unless Dir.exist?(theme_path)
-    puts "Error: Theme directory not found: #{theme_path}"
-    exit 1
-  end
-
-  # Parse options from remaining arguments
+  # Parse options from remaining arguments (needed before env load for --api_url)
   options = parse_options(option_args)
 
-  # Load environment from theme
-  env = AirogelCmsClient.load_theme_env(theme_path)
-  unless env
-    puts "Error: Could not load .env file from theme directory"
-    puts "Make sure #{theme_path}/.env exists with AIROGEL_API_URL, AIROGEL_ACCOUNT_ID, and AIROGEL_API_KEY"
-    exit 1
-  end
+  # Actions that don't need a theme directory (register only needs --api_url)
+  if NO_THEME_ACTIONS.include?(action)
+    api_url = options.delete(:api_url) || "https://api.airogelcms.com"
+    # Instantiate with no token — register uses make_unauthenticated_post_request
+    client = AirogelCmsClient.new(api_url, nil)
+    account_id = nil
+  else
+    unless Dir.exist?(theme_path)
+      puts "Error: Theme directory not found: #{theme_path}"
+      exit 1
+    end
 
-  # Create client
-  client = AirogelCmsClient.new(env[:api_url], env[:api_key])
-  account_id = env[:account_id]
+    # Load environment from theme
+    env = AirogelCmsClient.load_theme_env(theme_path)
+    unless env
+      puts "Error: Could not load .env file from theme directory"
+      puts "Make sure #{theme_path}/.env exists with AIROGEL_API_URL, AIROGEL_ACCOUNT_ID, and AIROGEL_API_KEY"
+      exit 1
+    end
+
+    # Create client
+    client = AirogelCmsClient.new(env[:api_url], env[:api_key])
+    account_id = env[:account_id]
+  end
 
   # Execute action
   case action
+  # ============================================================
+  # Account creation & subscription
+  # ============================================================
+
+  when "register"
+    # Creates a new user, account, and API token in one unauthenticated request.
+    # Does not require a theme .env — only --api_url (defaults to production).
+    #
+    # Usage:
+    #   bin/airogelcms <theme> register \
+    #     --name="Jane Doe" --email=jane@example.com \
+    #     --password=secret123 --account_name="Jane's Site"
+    #
+    # After success, write the returned credentials into themes/<theme>/.env:
+    #   AIROGEL_API_URL=https://api.airogelcms.com
+    #   AIROGEL_ACCOUNT_ID=<account.id>
+    #   AIROGEL_API_KEY=<api_token>
+    required = %i[name email password account_name]
+    missing = required.reject { |k| options[k] }
+    unless missing.empty?
+      output_result(
+        success: false,
+        error: "Missing required options: #{missing.map { |k| "--#{k}" }.join(", ")}"
+      )
+      exit 1
+    end
+
+    response = client.register(
+      name: options[:name],
+      email_address: options[:email],
+      password: options[:password],
+      account_name: options[:account_name],
+      terms_of_service: options.fetch(:terms_of_service, "1")
+    )
+
+    if response["error"] || response["errors"]
+      output_result(
+        success: false,
+        error: response["error"] || "Registration failed",
+        details: response["errors"]
+      )
+    else
+      # Pretty-print the .env snippet so the user can paste it immediately
+      account_id_val = response.dig("account", "id")
+      api_token_val  = response["api_token"]
+      api_url_val    = options[:api_url] || "https://api.airogelcms.com"
+
+      output_result(
+        success: true,
+        data: response,
+        message: "Account created. Add the following to themes/#{theme_name}/.env:\n\n" \
+                 "AIROGEL_API_URL=#{api_url_val}\n" \
+                 "AIROGEL_ACCOUNT_ID=#{account_id_val}\n" \
+                 "AIROGEL_API_KEY=#{api_token_val}"
+      )
+    end
+
+  when "list_plans"
+    # Lists visible subscription plans. Does not require an active subscription.
+    #
+    # Usage:
+    #   bin/airogelcms <theme> list_plans
+    #   bin/airogelcms <theme> list_plans --interval=month
+    response = client.list_plans(interval: options[:interval])
+    handle_api_response(response)
+
+  when "create_account"
+    # Creates an additional account for the authenticated user.
+    # Useful when one user manages multiple sites.
+    #
+    # Usage:
+    #   bin/airogelcms <theme> create_account --name="My Second Site"
+    unless options[:name]
+      output_result(success: false, error: "Missing required option: --name")
+      exit 1
+    end
+    response = client.create_account(name: options[:name])
+    handle_api_response(response, "Account created successfully")
+
+  when "subscription_checkout"
+    # Generates a Stripe Checkout URL. Open it in a browser to subscribe.
+    #
+    # Usage:
+    #   bin/airogelcms <theme> subscription_checkout --plan=plan_xxx
+    #   bin/airogelcms <theme> subscription_checkout --plan=plan_xxx \
+    #     --success_url=https://example.com/done --cancel_url=https://example.com/pricing
+    unless options[:plan]
+      output_result(success: false, error: "Missing required option: --plan")
+      exit 1
+    end
+    response = client.subscription_checkout(
+      account_id,
+      plan: options[:plan],
+      success_url: options[:success_url],
+      cancel_url: options[:cancel_url]
+    )
+    if response["checkout_url"]
+      output_result(
+        success: true,
+        data: { checkout_url: response["checkout_url"] },
+        message: "Open this URL in a browser to complete your subscription:\n#{response["checkout_url"]}"
+      )
+    else
+      handle_api_response(response)
+    end
+
+  when "subscription_status"
+    # Checks whether the account has an active subscription.
+    # Poll this after completing Stripe Checkout.
+    #
+    # Usage:
+    #   bin/airogelcms <theme> subscription_status
+    response = client.subscription_status(account_id)
+    handle_api_response(response)
+
   # ============================================================
   # Theme operations (existing)
   # ============================================================

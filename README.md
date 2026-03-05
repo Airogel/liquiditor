@@ -63,6 +63,10 @@ Then open `http://localhost:4567`.
 
 - Create and seed local DB: `bundle exec rake db:create db:seed`
 - Create a new theme scaffold: `bundle exec rake create_theme[my_theme]`
+- **Register a new account** (no credentials needed): `bin/airogelcms $THEME register --name="..." --email=... --password=... --account_name="..."`
+- List subscription plans: `bin/airogelcms $THEME list_plans`
+- Get a Stripe Checkout URL: `bin/airogelcms $THEME subscription_checkout --plan=plan_xxx`
+- Check subscription status: `bin/airogelcms $THEME subscription_status`
 - Pull latest theme from CMS: `bin/airogelcms $THEME download_theme`
 - Push templates only: `bin/airogelcms $THEME upload_templates`
 - Push assets only: `bin/airogelcms $THEME upload_assets`
@@ -80,6 +84,7 @@ Liquiditor is local-first.
 ## Reference docs
 
 - `AGENTS.md` - working rules and AI assistant behavior for Liquiditor
+- `docs/ACCOUNT_SETUP.md` - creating a new account and subscribing via the CLI
 - `docs/CREATING_THEMES.md` - theme creation workflow
 - `docs/THEME_DOCUMENTATION.md` - theme structure and conventions
 - `docs/TAILWIND_HELP.md` - Tailwind v4 usage guidance

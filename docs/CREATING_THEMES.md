@@ -101,7 +101,47 @@ Edit any file in `templates/` or `css/` or `js/` — the browser reloads automat
 
 ## Step 4: Configure API Credentials
 
-Edit `themes/theme_name/.env`:
+You need `AIROGEL_API_URL`, `AIROGEL_ACCOUNT_ID`, and `AIROGEL_API_KEY` in `themes/theme_name/.env`. There are two ways to get them.
+
+### Option A: Register via the CLI (new users)
+
+If you don't have an Airogel CMS account yet, create one from the command line. No `.env` setup required first — just provide your details:
+
+```bash
+bin/airogelcms theme_name register \
+  --name="Your Name" \
+  --email=you@example.com \
+  --password=yourpassword \
+  --account_name="Your Site Name"
+```
+
+On success, the output includes a ready-to-paste `.env` snippet:
+
+```
+AIROGEL_API_URL=https://api.airogelcms.com
+AIROGEL_ACCOUNT_ID=acct_xxxxxxxxxxxxx
+AIROGEL_API_KEY=tok_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Paste those three lines into `themes/theme_name/.env`, then subscribe to a plan:
+
+```bash
+# See available plans
+bin/airogelcms theme_name list_plans
+
+# Generate a Stripe Checkout URL (replace plan_xxx with an ID from list_plans)
+bin/airogelcms theme_name subscription_checkout --plan=plan_xxx
+# → Prints a checkout.stripe.com URL — open it in your browser and pay
+
+# Confirm the subscription is active
+bin/airogelcms theme_name subscription_status
+```
+
+See `docs/ACCOUNT_SETUP.md` for the full walkthrough including troubleshooting.
+
+### Option B: Use existing credentials (existing users)
+
+Edit `themes/theme_name/.env` directly:
 
 ```bash
 AIROGEL_API_URL=https://api.airogelcms.com

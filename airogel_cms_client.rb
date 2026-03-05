@@ -70,6 +70,69 @@ class AirogelCmsClient
     make_request("/v1/accounts")
   end
 
+  # ============================================================
+  # Registration (unauthenticated — no API token required)
+  # ============================================================
+
+  # Create a new user, account, and API token in one request.
+  # Returns { "user" => ..., "account" => ..., "api_token" => "..." }
+  # The caller should persist api_token and account["id"] into the
+  # theme's .env file so subsequent commands can authenticate.
+  def register(name:, email_address:, password:, account_name:, terms_of_service: "1")
+    make_unauthenticated_post_request("/v1/registration", {
+      registration: {
+        name: name,
+        email_address: email_address,
+        password: password,
+        terms_of_service: terms_of_service,
+        account_name: account_name
+      }
+    })
+  end
+
+  # ============================================================
+  # Account creation (authenticated — requires existing API token)
+  # ============================================================
+
+  # Create an additional account under the authenticated user.
+  # Useful when an existing user wants a second site.
+  def create_account(name:)
+    make_post_request("/v1/accounts", { account: { name: name } })
+  end
+
+  # ============================================================
+  # Plans (no active subscription required)
+  # ============================================================
+
+  # List publicly visible subscription plans.
+  # Pass interval: "month" or "year" to filter.
+  def list_plans(interval: nil)
+    endpoint = "/v1/plans"
+    endpoint += "?interval=#{interval}" if interval
+    make_request(endpoint)
+  end
+
+  # ============================================================
+  # Subscriptions (no active subscription required on these)
+  # ============================================================
+
+  # Generate a Stripe Checkout URL for subscribing an account to a plan.
+  # Returns { "checkout_url" => "https://checkout.stripe.com/..." }
+  # The user must open checkout_url in a browser to complete payment.
+  def subscription_checkout(account_id, plan:, success_url: nil, cancel_url: nil)
+    body = { plan: plan }
+    body[:success_url] = success_url if success_url
+    body[:cancel_url] = cancel_url if cancel_url
+    make_post_request("/v1/accounts/#{account_id}/subscription/checkout", body)
+  end
+
+  # Poll whether an account has an active subscription.
+  # Returns { "subscribed" => bool, "plan" => {...}, "subscription" => {...} }
+  # Useful after directing the user to the checkout URL.
+  def subscription_status(account_id)
+    make_request("/v1/accounts/#{account_id}/subscription/status")
+  end
+
   def get_templates(account_id)
     make_request("/v1/accounts/#{account_id}/templates")
   end
@@ -686,6 +749,26 @@ class AirogelCmsClient
     end
   rescue => e
     { error: e.message }
+  end
+
+  # POST without an Authorization header — used for the registration endpoint.
+  def make_unauthenticated_post_request(endpoint, body)
+    uri = URI("#{@base_url}#{endpoint}")
+    http = build_http(uri)
+
+    request = Net::HTTP::Post.new(uri)
+    request["Content-Type"] = "application/json"
+    request.body = body.to_json
+
+    response = http.request(request)
+
+    if response.code.to_i >= 200 && response.code.to_i < 300
+      JSON.parse(response.body)
+    else
+      { "error" => "HTTP #{response.code}: #{response.body}", "status" => response.code.to_i }
+    end
+  rescue => e
+    { "error" => e.message }
   end
 
   def make_post_request(endpoint, body)
