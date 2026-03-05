@@ -147,7 +147,8 @@ bin/airogelcms {THEME} delete_blueprint --id=blog-post
 | Type | Description |
 |------|-------------|
 | `text` | Plain text |
-| `rich_text` | HTML content |
+| `rich_text` | HTML content (Trix/ActionText editor) |
+| `raw_html` | Raw HTML — stored and rendered verbatim, no sanitization |
 | `image` | Image attachment |
 | `video` | Video embed |
 | `gallery` | Multiple images |

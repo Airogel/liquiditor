@@ -426,6 +426,7 @@ FIELD_TYPE_DESCRIPTIONS = {
   "list" => "Array of strings",
   "dictionary" => "Object (key/value pairs)",
   "rich_text" => "String (HTML)",
+  "raw_html" => "String (raw HTML, output verbatim)",
   "text" => "String",
   "unknown" => "Mixed"
 }.freeze
@@ -664,6 +665,7 @@ def generate_liquid_docs(theme_path)
         notes = case field_type
         when "entity_array", "entity_single" then "Resolved entry reference"
         when "rich_text" then "Output raw HTML with `{{ ... }}`"
+        when "raw_html" then "Verbatim HTML — output with `{{ ... }}` (no sanitization)"
         when "image" then "Use `| image_tag:` filter"
         when "video" then "Use `| video_player` filter"
         when "gallery" then "Loop with `for item in ...`"
