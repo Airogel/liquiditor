@@ -162,26 +162,45 @@ class PiSessionManager
     @sessions = {}
     @sessions_mutex = Mutex.new
     FileUtils.mkdir_p(@session_dir)
+
+    # Keep exactly one long-lived pi RPC process and multiplex logical
+    # sessions over it via switch_session.
+    @rpc_session = PiRpcSession.new("default", @session_dir, provider: @provider, model: @model)
   end
 
   def get_session(session_id)
     @sessions_mutex.synchronize do
-      @sessions[session_id] ||= PiRpcSession.new(session_id, @session_dir, provider: @provider, model: @model)
+      @sessions[session_id] ||= PiSessionHandle.new(@rpc_session, session_id)
     end
   end
 
   def cleanup_session(session_id)
     @sessions_mutex.synchronize do
-      session = @sessions.delete(session_id)
-      session&.close
+      @sessions.delete(session_id)
     end
   end
 
   def cleanup_all
     @sessions_mutex.synchronize do
-      @sessions.each_value(&:close)
       @sessions.clear
+      @rpc_session&.close
+      @rpc_session = nil
     end
+  end
+end
+
+class PiSessionHandle
+  def initialize(rpc_session, session_id)
+    @rpc_session = rpc_session
+    @session_id = sanitize_session_id(session_id)
+  end
+
+  def prompt(message, &block)
+    @rpc_session.prompt(message, session_id: @session_id, &block)
+  end
+
+  def close
+    nil
   end
 end
 
@@ -202,17 +221,34 @@ class PiRpcSession
     @mutex = Mutex.new
     @process = nil
     @request_counter = 0
+    @active_session_id = nil
     start_process
   end
 
   def start_process
     @stdin, @stdout, @stderr, @wait_thr = Open3.popen3(*@pi_cmd)
     @reader_thread = Thread.new { read_output }
+    @stderr_thread = Thread.new { drain_stderr }
     @response_queue = {}
     @event_handlers = []
+  end
 
-    return unless File.exist?(@session_file)
-    send_command({ type: "switch_session", sessionPath: @session_file })
+  def drain_stderr
+    @stderr.each_line do |line|
+      puts "pi[stderr]: #{line.chomp}"
+    end
+  rescue IOError, Errno::EPIPE
+    # Process terminated
+  end
+
+  def switch_session(session_id)
+    normalized_id = sanitize_session_id(session_id)
+    normalized_id = "default" if normalized_id.empty?
+    return if @active_session_id == normalized_id
+
+    session_file = File.join(@session_dir, "#{normalized_id}.jsonl")
+    send_command({ type: "switch_session", sessionPath: session_file })
+    @active_session_id = normalized_id
   end
 
   def read_output
@@ -261,7 +297,9 @@ class PiRpcSession
     end
   end
 
-  def prompt(message, &block)
+  def prompt(message, session_id: nil, &block)
+    switch_session(session_id || @session_id)
+
     response_text = ""
     agent_ended = false
     condition = ConditionVariable.new
@@ -324,6 +362,7 @@ class PiRpcSession
       nil
     end
     @reader_thread&.kill
+    @stderr_thread&.kill
     begin
       Process.kill("TERM", @wait_thr.pid)
     rescue
@@ -357,6 +396,12 @@ class PiSessionShipper
     @api_key = ENV["AIROGEL_API_KEY"]
     @mutex = Mutex.new
     FileUtils.mkdir_p(@offsets_dir)
+
+    if @api_key
+      puts "PiSessionShipper: initialized (api_url=#{@api_url}, session_dir=#{@session_dir})"
+    else
+      puts "PiSessionShipper: WARNING — AIROGEL_API_KEY not set, log shipping disabled"
+    end
   end
 
   # Ship any unshipped lines across all known session files.
