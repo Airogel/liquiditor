@@ -6,7 +6,7 @@ Start with `README.md` for Liquiditor setup, architecture, and core command work
 
 ## What You're Working With
 
-Liquiditor is a local Liquid template previewer backed by SQLite. It renders websites identically to the Airogel CMS production environment. The user sees a live preview in their browser and chats with you via the floating widget in the bottom-right corner.
+Liquiditor is a local Liquid template previewer that renders websites identically to the Airogel CMS production environment. The user sees a live preview in their browser and chats with you via the floating widget in the bottom-right corner.
 
 ### Environment
 
@@ -16,13 +16,12 @@ Liquiditor is a local Liquid template previewer backed by SQLite. It renders web
 - **JS**: `themes/{THEME}/js/application.js` (esbuild entry point, Stimulus controllers)
 - **Stimulus controllers**: `themes/{THEME}/js/controllers/`
 - **Built assets**: `themes/{THEME}/assets/` (compiled CSS/JS, images, fonts)
-- **Database**: `themes/{THEME}/database.sqlite3` (SQLite, content and config)
-- **Liquid tags reference**: `themes/{THEME}/docs/liquid_tags.md` (auto-generated — all collections, fields, globals, navigations, forms for this theme)
+- **Liquid tags reference**: `themes/{THEME}/docs/liquid_tags.md` (auto-generated -- all collections, fields, globals, navigations, forms for this theme)
 - **Inspiration files**: `themes/{THEME}/.inspirations/` (reference files uploaded by the user -- screenshots, design docs, etc.)
 
 ### Liquid Tags Reference
 
-**Always read `themes/{THEME}/docs/liquid_tags.md` before writing any template code.** This file is auto-generated from the theme's database and lists every collection handle, blueprint field name and type, global variable, navigation handle, and form handle specific to this site.
+**Always read `themes/{THEME}/docs/liquid_tags.md` before writing any template code.** This file is auto-generated and lists every collection handle, blueprint field name and type, global variable, navigation handle, and form handle specific to this site.
 
 It is regenerated automatically after `download_theme` and `download_database`. To regenerate manually:
 
@@ -45,9 +44,120 @@ When you edit files in the theme, the browser automatically reloads. The user wi
 
 CSS and JS are rebuilt by background watchers (Tailwind and esbuild). Editing the source files in `css/` or `js/` will trigger a rebuild, which then triggers a live reload.
 
-## Syncing with the Main CMS Site
+## Reading and Writing Content Data (Critical)
 
-Liquiditor is local-first. File and SQLite edits do **not** automatically update the live CMS site.
+**All content data operations MUST go through `bin/airogelcms` CLI commands.** Do NOT read or write the local SQLite database directly. Do not use `sqlite3`, `python3 sqlite3`, or any other method to query or modify `database.sqlite3`.
+
+The local SQLite database is a read-only cache for the Liquiditor preview server. It is populated by `download_database`/`download_theme` and should never be edited by the agent.
+
+### Reading Data
+
+Use these CLI commands to query content data. All output is JSON.
+
+```bash
+# List all collections
+bin/airogelcms {THEME} list_collections
+
+# Get a specific collection by handle or ID
+bin/airogelcms {THEME} get_collection --id=page
+
+# List entries in a collection
+bin/airogelcms {THEME} list_entries --collection=units
+
+# Get a specific entry (returns all field data)
+bin/airogelcms {THEME} get_entry --collection=units --id=unit-1
+
+# List globals
+bin/airogelcms {THEME} list_globals
+
+# Get a specific global by handle
+bin/airogelcms {THEME} get_global --id=site
+
+# List navigations
+bin/airogelcms {THEME} list_navigations
+
+# Get a navigation with its items
+bin/airogelcms {THEME} get_navigation --id=main_navigation
+
+# List navigation items
+bin/airogelcms {THEME} list_navigation_items --navigation=main_navigation
+
+# List blueprints (field schemas)
+bin/airogelcms {THEME} list_blueprints
+
+# Get a specific blueprint
+bin/airogelcms {THEME} get_blueprint --id=page
+```
+
+### Writing Data
+
+Use these CLI commands to create, update, and delete content. After any write, run `download_database` to sync the local preview.
+
+```bash
+# Create an entry
+bin/airogelcms {THEME} create_entry --collection=page --handle=my-page --title="My Page" \
+  --fields='{"body": "<p>Page content</p>"}'
+
+# Update an entry
+bin/airogelcms {THEME} update_entry --collection=page --id=my-page \
+  --fields='{"body": "<p>Updated content</p>"}'
+
+# Delete an entry
+bin/airogelcms {THEME} delete_entry --collection=page --id=my-page
+
+# Update a global
+bin/airogelcms {THEME} update_global --id=site \
+  --field_values='{"title": "New Site Title", "description": "Updated description"}'
+
+# Create a navigation item
+bin/airogelcms {THEME} create_navigation_item --navigation=main_navigation \
+  --title="My Page" --url="/my-page" --priority=2
+
+# Update a navigation item
+bin/airogelcms {THEME} update_navigation_item --navigation=main_navigation --id=<item_id> \
+  --title="New Title"
+
+# Delete a navigation item
+bin/airogelcms {THEME} delete_navigation_item --navigation=main_navigation --id=<item_id>
+
+# Create a collection
+bin/airogelcms {THEME} create_collection --name="Blog Posts" --handle=posts \
+  --routing="posts/:handle"
+
+# Update a collection
+bin/airogelcms {THEME} update_collection --id=posts --orderable=ascending
+
+# Create a blueprint
+bin/airogelcms {THEME} create_blueprint --handle=blog_post --title="Blog Post" \
+  --fields='[{"handle":"body","type":"rich_text"},{"handle":"excerpt","type":"text"}]'
+
+# Create a global
+bin/airogelcms {THEME} create_global --handle=site_settings --title="Site Settings" \
+  --fields='[{"handle":"logo","type":"image"}]'
+```
+
+### Syncing After Content Changes
+
+After any content write (create, update, delete), refresh local data so the preview reflects changes:
+
+```bash
+bin/airogelcms {THEME} download_database
+```
+
+This downloads the latest data from the CMS API and rebuilds the local database and liquid docs.
+
+### Do NOT Use SQLite Directly
+
+These are all prohibited:
+
+- `sqlite3 themes/{THEME}/database.sqlite3 "..."`
+- `python3 -c "import sqlite3; ..."`
+- Any direct reads from or writes to `database.sqlite3`
+- Using `database.sqlite3` as a data source for analysis or debugging
+
+If you need to understand the content model, use `bin/airogelcms` list/get commands or read `themes/{THEME}/docs/liquid_tags.md`.
+
+## Syncing with the Main CMS Site
 
 Use `bin/airogelcms` for all CMS sync operations:
 
@@ -65,8 +175,7 @@ bin/airogelcms {THEME} upload_assets
 - **Do not auto-push**: only run upload commands when the user explicitly asks to sync/publish to the main site.
 - **Pull first when unsure**: run `download_theme` before major edits or when drift is possible.
 - **Templates/assets are file-based sync**: local edits in `templates/` and `assets/` require upload commands to reach the main site.
-- **SQLite edits are local unless you call API actions**: changes made directly in `database.sqlite3` stay local. To update the main site's content model/data, use `bin/airogelcms` CRUD actions (`create_entry`, `update_entry`, `create_collection`, `update_global`, etc.).
-- **`upload_theme` only uploads templates + assets**: it does not push local SQLite content rows to the CMS.
+- **`upload_theme` only uploads templates + assets**: it does not push content data to the CMS.
 - **Use exact credential keys**: theme auth config uses `AIROGEL_API_URL`, `AIROGEL_ACCOUNT_ID`, and `AIROGEL_API_KEY` in `themes/{THEME}/.env`.
 - **Prefer the narrowest upload**: if only templates changed, run `upload_templates`; if only assets changed, run `upload_assets`; run both when both changed.
 - **When user says "sync this"**: execute the relevant `bin/airogelcms` command(s), do not only describe them.
@@ -80,7 +189,7 @@ bin/airogelcms {THEME} upload_assets
 4. If the user wants main-site sync, upload files:
    - `bin/airogelcms {THEME} upload_templates`
    - `bin/airogelcms {THEME} upload_assets`
-5. If content/data also changed, run needed CRUD commands via `bin/airogelcms` (not raw SQLite-only updates).
+5. If content/data also changed, run needed CRUD commands via `bin/airogelcms`, then `download_database`.
 
 ### Sync Intent Mapping
 
@@ -98,19 +207,6 @@ bin/airogelcms {THEME} upload_assets
 - If a user asks to "sync" or "synchronize", execute upload command(s); do not reply with only build results.
 - If build is needed before sync, do both: build first, then `bin/airogelcms ... upload_*`, and report both steps clearly.
 
-### Content Changes: API-First (Critical)
-
-- For requests like "add a page", "create an entry", "update navigation", "update globals", or "put this content on my website", use `bin/airogelcms` CRUD actions against the CMS API.
-- Do not treat direct SQLite inserts/updates as a publish step.
-- After API content changes, refresh local data with `bin/airogelcms {THEME} download_database` so local SQLite matches CMS.
-- When the request is content-only, do not upload templates/assets unless theme files also changed.
-
-Recommended content-only flow:
-
-1. Create/update content via API (`create_entry`, `update_entry`, `create_navigation_item`, `update_global`, etc.).
-2. Run `bin/airogelcms {THEME} download_database` to sync local SQLite from CMS.
-3. Verify locally in preview.
-
 ### Pronoun Resolution for Sync Requests
 
 - If the user refers to "this", "these", "it", or "them" right after discussing edits, interpret that as the latest local theme changes.
@@ -121,20 +217,18 @@ Recommended content-only flow:
 
 - If the user asks to put changes "on my website" after content edits, treat that as a content publish request.
 - Use API CRUD for content updates, then `bin/airogelcms {THEME} download_database`.
-- Do not default to editing local `database.yml`/SQLite only.
 
 ### Do Not Invent CLI Behavior
 
 Only state behavior that is supported by `bin/airogelcms` in this repo.
 
-- Do not claim `upload_theme` uploads SQLite rows/content data directly.
+- Do not claim `upload_theme` uploads content data directly.
 - Do not rename credential keys or file locations.
 - Do not claim a command was run if you only described it.
-- Do not create published content by writing only to `database.sqlite3` when the user asked for website/live changes.
 
 Wrong -> Right examples:
 
-- Wrong: "`upload_theme` syncs templates, assets, and `database.sqlite3` to the server."
+- Wrong: "`upload_theme` syncs templates, assets, and content data to the server."
 - Right: "`upload_theme` uploads templates and assets. Content/data changes require CRUD actions (for example `update_entry`, `update_global`)."
 
 - Wrong: "Credentials are `API_URL` and `API_KEY`."
@@ -143,8 +237,11 @@ Wrong -> Right examples:
 - Wrong: "I synced it." (without running commands)
 - Right: "I ran `bin/airogelcms {THEME} upload_templates` and `bin/airogelcms {THEME} upload_assets`; both returned success."
 
-- Wrong: "I added the page by inserting rows into `database.sqlite3`."
-- Right: "I ran `bin/airogelcms {THEME} create_entry ...` (and related API CRUD commands), then `bin/airogelcms {THEME} download_database` to sync local content data."
+- Wrong: "I read the database to check the entries." (using sqlite3/python3)
+- Right: "I ran `bin/airogelcms {THEME} list_entries --collection=page` to check the entries."
+
+- Wrong: "I updated the global by modifying database.sqlite3."
+- Right: "I ran `bin/airogelcms {THEME} update_global --id=site --field_values='{...}'`, then `bin/airogelcms {THEME} download_database` to sync locally."
 
 ## Templates (Liquid)
 
@@ -239,43 +336,6 @@ These are automatically resolved to full entry hashes when rendered. You can tra
 {% endfor %}
 ```
 
-## SQLite Database
-
-Content is stored in `themes/{THEME}/database.sqlite3`. You can query or modify it directly.
-
-### Tables
-
-| Table | Key Columns |
-|-------|-------------|
-| `content_paths` | `path`, `collection_handle`, `entry_handle`, `template_handle`, `layout_handle`, `is_index` |
-| `collections` | `handle`, `name`, `routing`, `index_routing`, `template_handle`, `orderable` |
-| `entries` | `collection_handle`, `handle`, `title`, `published`, `published_at`, `position`, `data` (JSON) |
-| `globals` | `handle`, `name`, `data` (JSON) |
-| `navigations` | `handle`, `title` |
-| `navigation_items` | `navigation_handle`, `title`, `url`, `collection_handle`, `entry_handle`, `position` |
-| `forms` | `handle`, `title`, `collection_handle`, `fields` (JSON array) |
-
-### Working with the Database
-
-Use `sqlite3` via bash to query or modify content:
-
-```bash
-# List all entries
-sqlite3 themes/{THEME}/database.sqlite3 "SELECT collection_handle, handle, title FROM entries"
-
-# View entry data
-sqlite3 themes/{THEME}/database.sqlite3 "SELECT data FROM entries WHERE handle='about'"
-
-# Update entry field data
-sqlite3 themes/{THEME}/database.sqlite3 "UPDATE entries SET data=json_set(data, '$.body', '<div>New content</div>') WHERE handle='about'"
-
-# Add a new content path
-sqlite3 themes/{THEME}/database.sqlite3 "INSERT INTO content_paths (path, collection_handle, entry_handle, template_handle, layout_handle) VALUES ('new-page', 'page', 'new-page', 'page', 'theme')"
-
-# List globals
-sqlite3 themes/{THEME}/database.sqlite3 "SELECT handle, data FROM globals"
-```
-
 ## Styling with Tailwind CSS v4
 
 The theme uses Tailwind CSS v4. The input file is `themes/{THEME}/css/application.tailwind.css`. The built output goes to `themes/{THEME}/assets/application.css`.
@@ -355,34 +415,55 @@ Inspiration files are stored in `themes/{THEME}/.inspirations/`. When they exist
 ### Creating a New Page
 
 1. Create the template: `themes/{THEME}/templates/my-page.liquid`
-2. Add an entry to the database
-3. Add a content path mapping the URL to the entry and template
+2. Create the entry via the CMS API
+3. Sync the local database
 
 ```bash
-sqlite3 themes/{THEME}/database.sqlite3 "
-  INSERT INTO entries (prefix_id, collection_handle, handle, title, data, published)
-  VALUES ('cnety_$(openssl rand -hex 12)', 'page', 'my-page', 'My Page', '{\"body\": \"<div>Page content</div>\"}', 1);
+# Create the entry on the CMS
+bin/airogelcms {THEME} create_entry --collection=page --handle=my-page \
+  --title="My Page" --fields='{"body": "<p>Page content</p>"}'
 
-  INSERT INTO content_paths (path, collection_handle, entry_handle, template_handle, layout_handle)
-  VALUES ('my-page', 'page', 'my-page', 'my-page', 'theme');
-"
+# Sync local data so the preview reflects the change
+bin/airogelcms {THEME} download_database
 ```
+
+Note: Content paths are managed by the CMS based on collection routing rules. When you create an entry in a collection with routing like `page/:handle`, the CMS automatically creates the content path.
 
 ### Adding Navigation Items
 
 ```bash
-sqlite3 themes/{THEME}/database.sqlite3 "
-  INSERT INTO navigation_items (navigation_handle, title, url, position)
-  VALUES ('menu', 'My Page', '/my-page', 2);
-"
+bin/airogelcms {THEME} create_navigation_item --navigation=main_navigation \
+  --title="My Page" --url="/my-page" --priority=2
+bin/airogelcms {THEME} download_database
 ```
 
 ### Updating Site Globals
 
 ```bash
-sqlite3 themes/{THEME}/database.sqlite3 "
-  UPDATE globals SET data=json_set(data, '$.title', 'New Site Title') WHERE handle='site';
-"
+bin/airogelcms {THEME} update_global --id=site \
+  --field_values='{"title": "New Site Title"}'
+bin/airogelcms {THEME} download_database
+```
+
+### Investigating Content Issues
+
+When debugging why content isn't showing up in a template:
+
+```bash
+# Check what collections exist
+bin/airogelcms {THEME} list_collections
+
+# Check what entries are in a collection
+bin/airogelcms {THEME} list_entries --collection=units
+
+# Get full details of a specific entry
+bin/airogelcms {THEME} get_entry --collection=units --id=unit-1
+
+# Check globals for site-wide data
+bin/airogelcms {THEME} get_global --id=site
+
+# Also read the liquid tags reference for template variable mapping
+cat themes/{THEME}/docs/liquid_tags.md
 ```
 
 ### Forms Checklist
