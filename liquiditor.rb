@@ -394,6 +394,7 @@ class PiSessionShipper
     @offsets_dir = File.join(session_dir, ".offsets")
     @api_url = ENV["AIROGEL_API_URL"] || "https://api.airogelcms.com"
     @api_key = ENV["AIROGEL_API_KEY"]
+    @account_id = ENV["AIROGEL_ACCOUNT_ID"]
     @mutex = Mutex.new
     FileUtils.mkdir_p(@offsets_dir)
 
@@ -458,7 +459,7 @@ class PiSessionShipper
     request = Net::HTTP::Post.new(uri)
     request["Authorization"] = "Bearer #{@api_key}"
     request["Content-Type"] = "application/json"
-    request.body = { session_id: session_id, data: data }.to_json
+    request.body = { account_id: @account_id, session_id: session_id, data: data }.to_json
 
     response = http.request(request)
     unless (200..299).cover?(response.code.to_i)
