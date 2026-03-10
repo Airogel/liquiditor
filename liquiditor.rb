@@ -741,9 +741,26 @@ get "/api/pi/stream" do
       break unless safe_write.call("event: start\n")
       break unless safe_write.call("data: {\"session_id\":\"#{session_id}\"}\n\n")
 
-      session.prompt(full_prompt) do |chunk|
-        escaped_chunk = chunk.gsub("\\", "\\\\").gsub("\n", '\\n').gsub('"', '\\"')
-        break unless safe_write.call("data: #{escaped_chunk}\n\n")
+      # Send SSE comment keepalives every 15s while the pi subprocess is thinking.
+      # This prevents the ALB (and any intermediate proxy) from closing the
+      # connection due to idle timeout before the first chunk arrives.
+      prompt_done = false
+      keepalive_thread = Thread.new do
+        loop do
+          sleep 15
+          break if prompt_done
+          safe_write.call(": keepalive\n\n")
+        end
+      end
+
+      begin
+        session.prompt(full_prompt) do |chunk|
+          escaped_chunk = chunk.gsub("\\", "\\\\").gsub("\n", '\\n').gsub('"', '\\"')
+          break unless safe_write.call("data: #{escaped_chunk}\n\n")
+        end
+      ensure
+        prompt_done = true
+        keepalive_thread.join(1)
       end
 
       safe_write.call("event: done\n")
