@@ -107,35 +107,30 @@ def load_path(path)
   assigns["content_for_header"] = content_for_header(path)
   html = layout_tmpl.render!(assigns)
 
-  # Inject live reload client (long-poll)
+  # Inject live reload client (SSE)
   current_v = LIVE_RELOAD_MUTEX.synchronize { LIVE_RELOAD_VERSION[0] }
   livereload_script = <<~HTML
     <script>
     (function() {
       var v = #{current_v};
-      function poll() {
-        var xhr = new XMLHttpRequest();
-        xhr.open('GET', '/livereload?v=' + v, true);
-        xhr.responseType = 'json';
-        xhr.onload = function() {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            var d = xhr.response || JSON.parse(xhr.responseText || '{}');
-            if (d.changed) {
-              // Defer reload if Pi chat is actively streaming
-              if (window.__piChatStreaming) {
-                window.__piChatPendingReload = true;
-                return poll();
-              }
-              return location.reload();
-            }
-            if (typeof d.version === 'number') v = d.version;
+      function connect() {
+        var es = new EventSource('/livereload?v=' + v);
+        es.addEventListener('reload', function(e) {
+          var d = JSON.parse(e.data || '{}');
+          if (typeof d.version === 'number') v = d.version;
+          // Defer reload if Pi chat is actively streaming
+          if (window.__piChatStreaming) {
+            window.__piChatPendingReload = true;
+          } else {
+            location.reload();
           }
-          poll();
+        });
+        es.onerror = function() {
+          es.close();
+          setTimeout(connect, 3000);
         };
-        xhr.onerror = function() { setTimeout(poll, 3000); };
-        xhr.send();
       }
-      poll();
+      connect();
     })();
     </script>
   HTML
@@ -557,18 +552,49 @@ configure do
 end
 
 get "/livereload" do
-  content_type :json
+  content_type "text/event-stream"
   headers "Cache-Control" => "no-cache"
+
   client_version = params[:v].to_i
 
-  LIVE_RELOAD_MUTEX.synchronize do
-    unless LIVE_RELOAD_VERSION[0] > client_version
-      LIVE_RELOAD_COND.wait(LIVE_RELOAD_MUTEX, 25)
+  stream :keep_open do |out|
+    safe_write = lambda do |data|
+      out << data
+      true
+    rescue
+      false
+    end
+
+    loop do
+      # Wait up to 25s for a reload signal, then send a keepalive comment and
+      # loop. This releases the ConditionVariable lock between waits so other
+      # threads can signal it, and sends SSE keepalives so proxies don't close
+      # an idle connection.
+      signaled = LIVE_RELOAD_MUTEX.synchronize do
+        unless LIVE_RELOAD_VERSION[0] > client_version
+          LIVE_RELOAD_COND.wait(LIVE_RELOAD_MUTEX, 25)
+        end
+        LIVE_RELOAD_VERSION[0] > client_version
+      end
+
+      if signaled
+        current = LIVE_RELOAD_MUTEX.synchronize { LIVE_RELOAD_VERSION[0] }
+        client_version = current
+        payload = { version: current }.to_json
+        break unless safe_write.call("event: reload\n")
+        break unless safe_write.call("data: #{payload}\n\n")
+      else
+        # Keepalive — no change yet
+        break unless safe_write.call(": keepalive\n\n")
+      end
+    end
+  ensure
+    begin
+      out.close
+    rescue
+      nil
     end
   end
-
-  current = LIVE_RELOAD_MUTEX.synchronize { LIVE_RELOAD_VERSION[0] }
-  { version: current, changed: current > client_version }.to_json
 end
 
 # =============================================================================
@@ -705,75 +731,94 @@ end
 
 get "/api/pi/stream" do
   content_type "text/event-stream"
-  stream :keep_open do |out|
-    prompt = params[:prompt]
-    session_id = params[:session_id] || "default"
+  headers "Cache-Control" => "no-cache"
 
+  # Capture request params now — they are unavailable inside the stream block
+  # after the Puma thread is released.
+  prompt = params[:prompt]
+  session_id = params[:session_id] || "default"
+  context_parts = []
+  context_parts << "Active theme directory: #{theme_path}"
+  context_parts << "Content path: #{params[:content_path]}" if params[:content_path].present?
+  context_parts << "Page URL: #{params[:full_url]}" if params[:full_url].present?
+  context_parts << "Page title: #{params[:page_title]}" if params[:page_title].present?
+  context_parts << "Path: #{params[:pathname]}" if params[:pathname].present?
+  inspiration = inspiration_context
+  context_parts << "\n#{inspiration}" if inspiration
+  full_prompt = "The user is currently viewing the following page:\n#{context_parts.join("\n")}\n\nUser asks: #{prompt}"
+
+  # Use a Queue to decouple the LLM worker thread from the Rack streaming
+  # thread. Under Puma (threaded mode), stream :keep_open holds a Puma thread
+  # for the duration of the block. By pushing all work onto a background thread
+  # and draining a Queue here, the pattern remains correct regardless of whether
+  # the Rack adapter is evented or threaded: the stream block yields quickly
+  # between Queue#pop calls, freeing the scheduler.
+  #
+  # Sentinel: nil means the background thread finished (success or error).
+  queue = Queue.new
+
+  Thread.new do
     if prompt.nil? || prompt.empty?
-      out << "event: error\n"
-      out << "data: No prompt provided\n\n"
-      out.close
+      queue.push([ :event, "error" ])
+      queue.push([ :data, "No prompt provided" ])
+      queue.push(nil)
       next
     end
 
-    context_parts = []
-    context_parts << "Active theme directory: #{theme_path}"
-    context_parts << "Content path: #{params[:content_path]}" if params[:content_path].present?
-    context_parts << "Page URL: #{params[:full_url]}" if params[:full_url].present?
-    context_parts << "Page title: #{params[:page_title]}" if params[:page_title].present?
-    context_parts << "Path: #{params[:pathname]}" if params[:pathname].present?
-
-    inspiration = inspiration_context
-    context_parts << "\n#{inspiration}" if inspiration
-
-    full_prompt = "The user is currently viewing the following page:\n#{context_parts.join("\n")}\n\nUser asks: #{prompt}"
-
     begin
       session = settings.pi_session_manager.get_session(session_id)
+      queue.push([ :event, "start" ])
+      queue.push([ :data, "{\"session_id\":\"#{session_id}\"}" ])
 
-      safe_write = lambda do |data|
-        out << data
-        true
-      rescue
-        false
+      session.prompt(full_prompt) do |chunk|
+        escaped_chunk = chunk.gsub("\\", "\\\\").gsub("\n", '\\n').gsub('"', '\\"')
+        queue.push([ :chunk, escaped_chunk ])
       end
 
-      break unless safe_write.call("event: start\n")
-      break unless safe_write.call("data: {\"session_id\":\"#{session_id}\"}\n\n")
-
-      # Send SSE comment keepalives every 15s while the pi subprocess is thinking.
-      # This prevents the ALB (and any intermediate proxy) from closing the
-      # connection due to idle timeout before the first chunk arrives.
-      prompt_done = false
-      keepalive_thread = Thread.new do
-        loop do
-          sleep 15
-          break if prompt_done
-          safe_write.call(": keepalive\n\n")
-        end
-      end
-
-      begin
-        session.prompt(full_prompt) do |chunk|
-          escaped_chunk = chunk.gsub("\\", "\\\\").gsub("\n", '\\n').gsub('"', '\\"')
-          break unless safe_write.call("data: #{escaped_chunk}\n\n")
-        end
-      ensure
-        prompt_done = true
-        keepalive_thread.join(1)
-      end
-
-      safe_write.call("event: done\n")
-      safe_write.call("data: {}\n\n")
+      queue.push([ :event, "done" ])
+      queue.push([ :data, "{}" ])
     rescue => e
-      safe_write = lambda do |data|
-        out << data
-      rescue
-        nil
-      end
-      safe_write.call("event: error\n")
-      safe_write.call("data: #{e.message}\n\n")
+      queue.push([ :event, "error" ])
+      queue.push([ :data, e.message ])
     ensure
+      queue.push(nil)
+    end
+  end
+
+  stream :keep_open do |out|
+    safe_write = lambda do |data|
+      out << data
+      true
+    rescue
+      false
+    end
+
+    # Keepalive comments every 15s while waiting for the next queue item.
+    # Prevents ALB / intermediate proxies from closing an idle connection.
+    keepalive_thread = Thread.new do
+      loop do
+        sleep 15
+        break unless safe_write.call(": keepalive\n\n")
+      end
+    end
+
+    begin
+      loop do
+        msg = queue.pop
+        break if msg.nil?
+
+        type, payload = msg
+        case type
+        when :event
+          break unless safe_write.call("event: #{payload}\n")
+        when :data
+          break unless safe_write.call("data: #{payload}\n\n")
+        when :chunk
+          break unless safe_write.call("data: #{payload}\n\n")
+        end
+      end
+    ensure
+      keepalive_thread.kill
       begin
         out.close
       rescue
