@@ -149,38 +149,247 @@ end
 # Pi RPC Session Manager
 # =============================================================================
 
-class PiSessionManager
-  def initialize(session_dir: "./.pi/sessions", provider: nil, model: nil)
+def sanitize_session_id(session_id)
+  session_id.to_s.gsub(/[^a-zA-Z0-9_-]/, "")
+end
+
+# PiDaemon owns the single long-running `pi --mode rpc` process.
+#
+# Responsibilities:
+#   - Spawn and own the process (stdin/stdout/stderr pipes)
+#   - Read all output lines and route them:
+#       * "response" messages (with an "id") → per-request Queue registered via register_response_queue
+#       * all other events                   → broadcast to registered event handlers
+#   - Restart the process automatically if it exits (with exponential back-off)
+#   - Provide send_line(json_string) for callers to write a command
+#
+# It does NOT know about sessions, prompts, or the RPC protocol above raw JSON.
+class PiDaemon
+  MAX_RESTART_DELAY = 30 # seconds
+
+  def initialize(session_dir:, provider: nil, model: nil)
     @session_dir = session_dir
-    @provider = provider
-    @model = model
-    @sessions = {}
-    @sessions_mutex = Mutex.new
-    FileUtils.mkdir_p(@session_dir)
+    @pi_cmd = [ "pi", "--mode", "rpc", "--session-dir", session_dir ]
+    @pi_cmd.push("--provider", provider) if provider
+    @pi_cmd.push("--model", model) if model
 
-    # Keep exactly one long-lived pi RPC process and multiplex logical
-    # sessions over it via switch_session.
-    @rpc_session = PiRpcSession.new("default", @session_dir, provider: @provider, model: @model)
+    @mutex = Mutex.new
+    @write_mutex = Mutex.new
+    @response_queues = {}  # request_id => Queue
+    @event_handlers = {}  # handler_id => callable
+
+    @stopped = false
+    @restart_delay = 1
+
+    start_process
   end
 
-  def get_session(session_id)
-    @sessions_mutex.synchronize do
-      @sessions[session_id] ||= PiSessionHandle.new(@rpc_session, session_id)
+  # Register a handler that receives all non-response events while the block
+  # runs. The handler is removed when the block returns or raises.
+  def with_event_handler(handler_id, callable)
+    @mutex.synchronize { @event_handlers[handler_id] = callable }
+    yield
+  ensure
+    @mutex.synchronize { @event_handlers.delete(handler_id) }
+  end
+
+  # Register a response Queue for a specific request id before sending the
+  # command; unregister it in ensure. Returns the queue.
+  def register_response_queue(request_id)
+    q = Queue.new
+    @mutex.synchronize { @response_queues[request_id] = q }
+    q
+  end
+
+  def unregister_response_queue(request_id)
+    @mutex.synchronize { @response_queues.delete(request_id) }
+  end
+
+  # Write a raw JSON line to the daemon's stdin. Thread-safe.
+  def send_line(json)
+    @write_mutex.synchronize do
+      @stdin.puts(json)
+      @stdin.flush
+    end
+  rescue IOError, Errno::EPIPE => e
+    puts "PiDaemon: send_line failed (#{e.class}: #{e.message}) — process may be restarting"
+  end
+
+  def stop
+    @stopped = true
+    close_process
+  end
+
+  private
+
+  def start_process
+    @stdin, @stdout, @stderr, @wait_thr = Open3.popen3(*@pi_cmd)
+    puts "PiDaemon: started pi process (pid=#{@wait_thr.pid})"
+    @restart_delay = 1
+    @reader_thread = Thread.new { read_loop }
+    @stderr_thread = Thread.new { drain_stderr }
+  end
+
+  def close_process
+    [ @stdin, @stdout, @stderr ].each do |io|
+      io.close
+    rescue
+      nil
+    end
+    @reader_thread&.kill
+    @stderr_thread&.kill
+    begin
+      Process.kill("TERM", @wait_thr.pid)
+    rescue
+      nil
     end
   end
 
-  def cleanup_session(session_id)
-    @sessions_mutex.synchronize do
-      @sessions.delete(session_id)
+  def drain_stderr
+    @stderr.each_line { |line| puts "pi[stderr]: #{line.chomp}" }
+  rescue IOError, Errno::EPIPE
+    # process gone
+  end
+
+  def read_loop
+    @stdout.each_line do |line|
+      dispatch(line)
+    rescue JSON::ParserError
+      puts "PiDaemon: unparseable line: #{line.chomp}"
+    end
+  rescue IOError, Errno::EPIPE
+    # stdout closed
+  ensure
+    handle_exit
+  end
+
+  def dispatch(line)
+    event = JSON.parse(line)
+
+    if event["type"] == "response" && event["id"]
+      q = @mutex.synchronize { @response_queues[event["id"]] }
+      q&.push(event)
+    else
+      handlers = @mutex.synchronize { @event_handlers.values.dup }
+      handlers.each { |h| h.call(event) }
     end
   end
 
-  def cleanup_all
-    @sessions_mutex.synchronize do
-      @sessions.clear
-      @rpc_session&.close
-      @rpc_session = nil
+  def handle_exit
+    return if @stopped
+
+    exit_status = begin
+      @wait_thr&.value
+    rescue
+      nil
     end
+
+    # Clean up stale pipes / threads from the dead process before restarting.
+    # The reader thread (us) is about to return so killing it is a no-op, but
+    # close_process tidies stdin, stderr, and the stderr drain thread.
+    close_process
+
+    puts "PiDaemon: process exited (status=#{exit_status}) — restarting in #{@restart_delay}s"
+
+    sleep @restart_delay
+    @restart_delay = [ @restart_delay * 2, MAX_RESTART_DELAY ].min
+
+    start_process
+  end
+end
+
+# PiRpcSession sends commands to PiDaemon on behalf of one logical session.
+#
+# Responsibilities:
+#   - Track which logical session id is active on the daemon (switch_session)
+#   - Implement send_command (request/response round-trip)
+#   - Implement prompt (streaming LLM response)
+#
+# It does NOT own a process and does NOT block the daemon mutex during waits.
+class PiRpcSession
+  attr_reader :session_id
+
+  def initialize(session_id, session_dir, daemon:)
+    @session_id = sanitize_session_id(session_id)
+    @session_dir = session_dir
+    @daemon = daemon
+    @counter_mutex = Mutex.new
+    @request_counter = 0
+    @active_session_id = nil
+    @session_mutex = Mutex.new # serializes switch_session + prompt pairs
+  end
+
+  def switch_session(session_id)
+    normalized_id = sanitize_session_id(session_id)
+    normalized_id = "default" if normalized_id.empty?
+    return if @active_session_id == normalized_id
+
+    session_file = File.join(@session_dir, "#{normalized_id}.jsonl")
+    send_command({ type: "switch_session", sessionPath: session_file })
+    @active_session_id = normalized_id
+  end
+
+  def send_command(command)
+    request_id = next_request_id
+    command[:id] = request_id
+    q = @daemon.register_response_queue(request_id)
+
+    begin
+      @daemon.send_line(command.to_json)
+      Timeout.timeout(30) { q.pop }
+    ensure
+      @daemon.unregister_response_queue(request_id)
+    end
+  end
+
+  def prompt(message, session_id: nil, &block)
+    # The pi RPC protocol does not tag streaming events (message_update,
+    # agent_end, etc.) with a request id — they are broadcast globally on
+    # stdout. This means only one prompt can be in flight at a time on a
+    # given pi process; otherwise handler A would receive handler B's deltas.
+    #
+    # @session_mutex serializes the full prompt lifecycle: switch_session →
+    # send prompt → collect streaming events → agent_end. Concurrent callers
+    # queue behind this mutex. This is a protocol limitation, not a bug.
+    @session_mutex.synchronize do
+      switch_session(session_id || @session_id)
+
+      response_text = ""
+      done_queue = Queue.new
+      handler_id = "prompt-#{next_request_id}"
+
+      handler = lambda do |event|
+        case event["type"]
+        when "message_update"
+          ae = event["assistantMessageEvent"]
+          if ae && ae["type"] == "text_delta"
+            chunk = ae["delta"]
+            response_text += chunk
+            block&.call(chunk)
+          end
+        when "agent_end", "agent_error", "error"
+          done_queue.push(event["type"])
+        end
+      end
+
+      @daemon.with_event_handler(handler_id, handler) do
+        @daemon.send_line({ type: "prompt", message: message }.to_json)
+
+        Timeout.timeout(60) { done_queue.pop }
+      end
+
+      response_text
+    end
+  end
+
+  def close
+    nil # process lifecycle managed by PiDaemon
+  end
+
+  private
+
+  def next_request_id
+    @counter_mutex.synchronize { "req-#{@request_counter += 1}" }
   end
 end
 
@@ -199,169 +408,32 @@ class PiSessionHandle
   end
 end
 
-def sanitize_session_id(session_id)
-  session_id.to_s.gsub(/[^a-zA-Z0-9_-]/, "")
-end
-
-class PiRpcSession
-  attr_reader :session_id
-
-  def initialize(session_id, session_dir, provider: nil, model: nil)
-    @session_id = sanitize_session_id(session_id)
+class PiSessionManager
+  def initialize(session_dir: "./.pi/sessions", provider: nil, model: nil)
     @session_dir = session_dir
-    @session_file = File.join(@session_dir, "#{@session_id}.jsonl")
-    @pi_cmd = [ "pi", "--mode", "rpc", "--session-dir", @session_dir ]
-    @pi_cmd.push("--provider", provider) if provider
-    @pi_cmd.push("--model", model) if model
-    @mutex = Mutex.new
-    @process = nil
-    @request_counter = 0
-    @active_session_id = nil
-    start_process
+    @sessions = {}
+    @sessions_mutex = Mutex.new
+    FileUtils.mkdir_p(@session_dir)
+
+    # One long-running pi daemon process; all logical sessions multiplex over it.
+    @daemon = PiDaemon.new(session_dir: @session_dir, provider: provider, model: model)
+    @rpc_session = PiRpcSession.new("default", @session_dir, daemon: @daemon)
   end
 
-  def start_process
-    @stdin, @stdout, @stderr, @wait_thr = Open3.popen3(*@pi_cmd)
-    @reader_thread = Thread.new { read_output }
-    @stderr_thread = Thread.new { drain_stderr }
-    @response_queue = {}
-    @event_handlers = []
-  end
-
-  def drain_stderr
-    @stderr.each_line do |line|
-      puts "pi[stderr]: #{line.chomp}"
-    end
-  rescue IOError, Errno::EPIPE
-    # Process terminated
-  end
-
-  def switch_session(session_id)
-    normalized_id = sanitize_session_id(session_id)
-    normalized_id = "default" if normalized_id.empty?
-    return if @active_session_id == normalized_id
-
-    session_file = File.join(@session_dir, "#{normalized_id}.jsonl")
-    send_command({ type: "switch_session", sessionPath: session_file })
-    @active_session_id = normalized_id
-  end
-
-  def read_output
-    @stdout.each_line do |line|
-      event = JSON.parse(line)
-
-      if event["type"] == "response" && event["id"]
-        request_id = event["id"]
-        @mutex.synchronize do
-          queue = @response_queue[request_id]
-          queue&.push(event)
-        end
-      else
-        @mutex.synchronize do
-          @event_handlers.each { |handler| handler.call(event) }
-        end
-      end
-    rescue JSON::ParserError
-      puts "Failed to parse pi output: #{line}"
-    end
-  rescue IOError, Errno::EPIPE
-    # Process terminated
-  end
-
-  def send_command(command)
-    response_queue = Queue.new
-    request_id = nil
-
-    @mutex.synchronize do
-      request_id = "req-#{@request_counter += 1}"
-      command[:id] = request_id
-      @response_queue[request_id] = response_queue
-    end
-
-    @stdin.puts(command.to_json)
-    @stdin.flush
-
-    begin
-      Timeout.timeout(30) do
-        response_queue.pop
-      end
-    ensure
-      @mutex.synchronize do
-        @response_queue.delete(request_id)
-      end
+  def get_session(session_id)
+    @sessions_mutex.synchronize do
+      @sessions[session_id] ||= PiSessionHandle.new(@rpc_session, session_id)
     end
   end
 
-  def prompt(message, session_id: nil, &block)
-    switch_session(session_id || @session_id)
-
-    response_text = ""
-    agent_ended = false
-    condition = ConditionVariable.new
-
-    handler = lambda do |event|
-      case event["type"]
-      when "message_update"
-        assistant_event = event["assistantMessageEvent"]
-        if assistant_event && assistant_event["type"] == "text_delta"
-          chunk = assistant_event["delta"]
-          response_text += chunk
-          block&.call(chunk)
-        end
-      when "agent_end", "agent_error", "error"
-        agent_ended = true
-        condition.signal
-      end
-    end
-
-    @mutex.synchronize do
-      @event_handlers << handler
-    end
-
-    begin
-      command = { type: "prompt", message: message }
-      @stdin.puts(command.to_json)
-      @stdin.flush
-
-      @mutex.synchronize do
-        deadline = Time.now + 60
-        until agent_ended
-          remaining = deadline - Time.now
-          break if remaining <= 0
-          condition.wait(@mutex, remaining)
-        end
-      end
-
-      response_text
-    ensure
-      @mutex.synchronize do
-        @event_handlers.delete(handler)
-      end
-    end
+  def cleanup_session(session_id)
+    @sessions_mutex.synchronize { @sessions.delete(session_id) }
   end
 
-  def close
-    begin
-      @stdin.close
-    rescue
-      nil
-    end
-    begin
-      @stdout.close
-    rescue
-      nil
-    end
-    begin
-      @stderr.close
-    rescue
-      nil
-    end
-    @reader_thread&.kill
-    @stderr_thread&.kill
-    begin
-      Process.kill("TERM", @wait_thr.pid)
-    rescue
-      nil
+  def cleanup_all
+    @sessions_mutex.synchronize do
+      @sessions.clear
+      @daemon.stop
     end
   end
 end
