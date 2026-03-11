@@ -93,6 +93,10 @@ bin/airogelcms {THEME} get_blueprint --id=page
 
 Use these CLI commands to create, update, and delete content. After any write, run `download_database` to sync the local preview.
 
+**Rich text field sanitization**: The CMS sanitizes `body` and other `rich_text` fields. Tags like `<div>`, `<img>`, inline `style` attributes, and `<iframe>` are stripped on save. If you need to embed images or custom layout inside a page body, do it in the Liquid template instead — either in a dedicated template for that entry or with a `{% if page.handle == "..." %}` conditional in the shared template.
+
+**`update_entry` response caveat**: The entry object returned in the `update_entry` response may reflect sanitized or pre-update field values — do not rely on it to confirm your new value was stored verbatim. To verify what was actually persisted, make a separate `get_entry` call after the update.
+
 ```bash
 # Create an entry
 bin/airogelcms {THEME} create_entry --collection=page --handle=my-page --title="My Page" \
@@ -145,6 +149,8 @@ bin/airogelcms {THEME} download_database
 ```
 
 This downloads the latest data from the CMS API and rebuilds the local database and liquid docs.
+
+**Do not use `download_database` to verify a write succeeded.** It re-pulls from the remote CMS and overwrites the local database with whatever the remote currently has. To verify a write, use `get_entry` to read back what the API stored. Only run `download_database` when you want to intentionally resync the local preview from remote state.
 
 ### Do NOT Use SQLite Directly
 
@@ -484,3 +490,4 @@ When creating or updating forms in templates:
 - **Accessibility**: Include alt text on images, proper contrast ratios, keyboard navigation.
 - **Minimal changes**: Make the smallest change that accomplishes what the user asked. Don't refactor unrelated code.
 - **Explain what you did**: After making changes, briefly tell the user what changed and where to look.
+- **Template edits only affect the local preview**: Editing a `.liquid` file does not update the live site. To publish a template change, run `bin/airogelcms {THEME} upload_templates` — but only when the user explicitly asks to publish or go live.

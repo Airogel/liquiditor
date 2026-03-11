@@ -673,9 +673,30 @@ end
 # Cleanup
 # =============================================================================
 
+# Explicit SIGTERM handler so EC2 instance termination (which sends SIGTERM)
+# guarantees the log flush runs. Without this trap, SIGTERM kills the process
+# immediately in some Puma/Sinatra configurations and at_exit never fires.
+# Calling exit here triggers the at_exit block below for the actual flush.
+Signal.trap("TERM") do
+  # Signal.trap blocks run on the main thread in MRI and must not call
+  # blocking I/O directly. Spawn a thread to do the flush, join it so the
+  # main thread waits, then call exit to trigger the at_exit block below.
+  # ship_all is idempotent (byte-offset tracking), so the at_exit re-flush
+  # is a no-op if the SIGTERM flush already shipped everything.
+  Thread.new do
+    puts "PiSessionShipper: SIGTERM received, flushing logs..."
+    settings.pi_session_shipper.ship_all
+    puts "PiSessionShipper: SIGTERM flush complete."
+  rescue => e
+    puts "PiSessionShipper: SIGTERM flush error: #{e.message}"
+  end.join
+  exit
+end
+
 at_exit do
   # Flush any unshipped log lines before the pi processes are closed.
-  # This ensures all session data reaches the API even on clean shutdown.
+  # Covers clean shutdown (explicit exit, Ctrl-C/SIGINT) and runs as a
+  # safety net after the SIGTERM handler above (ship_all is idempotent).
   puts "PiSessionShipper: flushing logs before exit..."
   settings.pi_session_shipper.ship_all
   puts "PiSessionShipper: flush complete."
