@@ -132,23 +132,30 @@ task :import_yaml, [ :theme ] do |_t, args|
     end
   end
 
-  # -------------------------------------------------------------------------
-  # 3. Import navigations
-  # -------------------------------------------------------------------------
-  raw["navigation"]&.each do |nav_handle, items|
-    db[:navigations].insert(handle: nav_handle, title: nav_handle.capitalize)
+   # -------------------------------------------------------------------------
+   # 3. Import navigations
+   # -------------------------------------------------------------------------
+   insert_nav_items = lambda do |nav_handle, items, parent_id|
+     items.each_with_index do |item, idx|
+       row_id = db[:navigation_items].insert(
+         navigation_handle: nav_handle,
+         title: item["title"],
+         url: item["url"],
+         position: idx,
+         parent_id: parent_id
+       )
+       children = item["children"]
+       insert_nav_items.call(nav_handle, children, row_id) if children.is_a?(Array) && children.any?
+     end
+   end
 
-    next unless items.is_a?(Array)
-    items.each_with_index do |item, idx|
-      db[:navigation_items].insert(
-        navigation_handle: nav_handle,
-        title: item["title"],
-        url: item["url"],
-        position: idx
-      )
-    end
-    puts "  Imported navigation: #{nav_handle} (#{items.size} items)"
-  end
+   raw["navigation"]&.each do |nav_handle, items|
+     db[:navigations].insert(handle: nav_handle, title: nav_handle.capitalize)
+
+     next unless items.is_a?(Array)
+     insert_nav_items.call(nav_handle, items, nil)
+     puts "  Imported navigation: #{nav_handle} (#{items.size} root items)"
+   end
 
   # -------------------------------------------------------------------------
   # 4. Import forms

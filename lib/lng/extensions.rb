@@ -328,7 +328,8 @@ module Extensions
         collection = collection.is_a?(Array) ? collection : []
         collection_size = collection.size
 
-        current_page = (context["current_page"] || context["page"] || 1).to_i
+        raw_page = context["current_page"] || context["page"]
+        current_page = raw_page.is_a?(Integer) ? raw_page : 1
         current_page = 1 if current_page < 1
 
         total_pages = (collection_size > 0) ? (collection_size.to_f / @page_size).ceil : 1
@@ -341,6 +342,7 @@ module Extensions
 
         pagination = {
           "items" => current_items,
+          "entries" => current_items,
           "page_size" => @page_size,
           "current_page" => current_page,
           "current_offset" => offset,
@@ -444,7 +446,9 @@ module Extensions
       collection_handle = resolve_value(@options["collection"], context)
       return "" unless collection_handle&.then { |v| !v.empty? }
 
-      page = resolve_value(@options["page"], context)&.to_i || context["page"]&.to_i || 1
+      context_page = context["page"]
+      context_page = nil unless context_page.is_a?(Integer)
+      page = resolve_value(@options["page"], context)&.to_i || context_page || 1
       per_page = resolve_value(@options["per_page"], context)&.to_i || 25
       order_by = resolve_value(@options["order_by"], context) || "published_at"
       order_dir = resolve_value(@options["order_dir"], context) || "desc"

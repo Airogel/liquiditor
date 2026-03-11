@@ -200,10 +200,10 @@ bin/airogelcms {THEME} upload_assets
 ### Sync Intent Mapping
 
 - **"sync the theme" means CMS API sync**: run `bin/airogelcms {THEME} upload_templates` and `bin/airogelcms {THEME} upload_assets` (or `upload_theme`). Do not treat this as a local-only build.
-- User says "put them on my website", "put this live", "ship it", "publish it", or "make it live": treat as a request to sync the current local theme changes to the main CMS site via `bin/airogelcms` uploads.
-- User asks to "sync", "publish", or "push to main site" after template edits: run `bin/airogelcms {THEME} upload_templates`.
+- User says "put them on my website", "put this live", "ship it", "publish it", "sync these", or "make it live": **always run both `upload_templates` AND `upload_assets`**. A generic sync request should never run only one. Assets include compiled CSS/JS (`application.css`, `application.js`) that the site cannot function without.
+- User asks to sync after template-only edits (and explicitly says only templates changed): run `bin/airogelcms {THEME} upload_templates`.
 - User asks to sync after style/script/image changes: run `bin/airogelcms {THEME} upload_assets`.
-- Both template and asset changes: run both commands.
+- When in doubt, run both commands.
 - If remote drift is likely, pull first with `bin/airogelcms {THEME} download_theme`, then re-apply/verify and upload.
 
 ### Build vs Sync (Critical)
@@ -286,6 +286,8 @@ Entry data is accessed via the collection handle. For example, if the collection
 
 On index pages, entries are in an array: `{{ post.entries }}`.
 
+**Only the page's own collection is injected as a template variable.** On an entry page for collection `chapters`, only `{{ chapters.* }}` is available. On an index page for collection `parts`, only `{{ parts.entries }}` is available. No other collection's data is implicitly present — use `{% query %}` to load data from any other collection.
+
 ### Custom Tags
 
 ```liquid
@@ -295,12 +297,71 @@ On index pages, entries are in an array: `{{ post.entries }}`.
 
 {% cms_scripts %}                          <!-- loads chat widget -->
 {% paginate post.entries by 10 %}
-  {% for entry in paginate.items %}...{% endfor %}
+  {% for entry in paginate.entries %}...{% endfor %}  <!-- paginate.items is also valid -->
 {% endpaginate %}
 
 {% render 'partial_name' %}                <!-- includes another .liquid file -->
 {% locale %}                               <!-- outputs "en-us" -->
 ```
+
+### `{% query %}` — Cross-Collection Queries
+
+Use `{% query %}` whenever a template needs entries from a collection that isn't the page's own collection. This is the only supported way to load cross-collection data inside a template.
+
+**Basic usage — fetch entries into a variable:**
+
+```liquid
+{% query collection: "parts", order_by: "position", order_dir: "asc", per_page: 100 %}
+  {% assign all_parts = query.entries %}
+{% endquery %}
+
+{% for part in all_parts %}
+  <a href="{{ part.content_path }}">{{ part.title }}</a>
+{% endfor %}
+```
+
+**Supported options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `collection` | *(required)* | Collection handle to query |
+| `order_by` | `published_at` | Field to sort by (e.g. `position`, `title`, any blueprint field handle) |
+| `order_dir` | `desc` | Sort direction: `asc` or `desc` |
+| `per_page` | `25` | Max entries to return (max: 100) |
+| `page` | `1` | Page number (or reads ambient `page` variable on paginated index pages) |
+| `published` | `true` | Set `false` to include unpublished entries |
+
+**`query` object fields inside the block:**
+
+| Variable | Description |
+|----------|-------------|
+| `query.entries` | Array of entry objects (each has `content_path`, `title`, `handle`, and all blueprint fields) |
+| `query.results` | Alias for `query.entries` |
+| `query.total` | Total count of matching entries |
+| `query.pagination.current_page` | Current page number |
+| `query.pagination.total_pages` | Total number of pages |
+| `query.pagination.total_count` | Total matching entries |
+| `query.pagination.has_previous` | Boolean |
+| `query.pagination.has_next` | Boolean |
+
+**Filtering by a related entry (entity field):**
+
+```liquid
+{% query collection: "chapters", order_by: "position", order_dir: "asc", per_page: 100,
+  filter: { fields: [{ path: "part", op: "eq", value: parts.id }] } %}
+  {% assign part_chapters = query.entries %}
+{% endquery %}
+```
+
+The `value` in a filter can be a Liquid variable reference resolved at render time (e.g. `parts.id` gives the current entry's prefix ID), or a quoted string literal. Use the entry's `id` field to match entity reference fields.
+
+**Important constraints:**
+
+- Always assign `query.entries` to a variable **inside** the `{% query %}...{% endquery %}` block. The `query` variable is scoped to the block and unavailable after `{% endquery %}`.
+- `{% query %}` returns only published entries by default. Pass `published: false` only when drafts are explicitly needed.
+- Do not use Liquid `where` or `where_exp` filters to filter collection data — these are Jekyll-only filters and do not exist in Liquid 5. Use `{% query %}` with a `filter:` option, or filter with a plain `{% for %}` + `{% if %}` loop.
+- On pages where the collection handle is `page` (the common Pages collection), `context["page"]` holds the entry data, not a page number. Always pass `page: 1` explicitly if you need a specific page rather than relying on the ambient value.
+- **Never use `other_collection.entries` on a page that belongs to a different collection.** For example, on a `parts` index page, writing `{{ chapters.entries }}` will render nothing because `chapters` is not injected. Always use `{% query collection: 'chapters', ... %}` instead. This is a common mistake when a page needs to display data from multiple collections.
 
 ### Rendering Partials (`render`) - Pass Variables Explicitly
 

@@ -206,14 +206,15 @@ module Database
 
       case resolved[:type]
       when :entity
-        # Entity fields store {"handle": "...", "collection": "..."} in data JSON
-        handle_expr = Sequel.lit("json_extract(data, ?)", "$.#{path}.handle")
-        coll_expr = Sequel.lit("json_extract(data, ?)", "$.#{path}.collection")
+        # Locally, entity fields are stored as resolved hashes: {"id": "cnety_...", "handle": "...", "title": "...", "content_path": "..."}
+        # The "collection" key is NOT present in the stored data (it was stripped during resolution).
+        # Match on the prefix_id stored in the "id" sub-key, which is unique and always present.
+        id_expr = Sequel.lit("json_extract(data, ?)", "$.#{path}.id")
         case op
         when "eq"
-          ds = ds.where(handle_expr => resolved[:handle], coll_expr => resolved[:collection])
+          ds = ds.where(id_expr => resolved[:prefix_id])
         when "ne"
-          ds = ds.exclude(handle_expr => resolved[:handle], coll_expr => resolved[:collection])
+          ds = ds.exclude(id_expr => resolved[:prefix_id])
         end
       when :scalar
         json_expr = Sequel.lit("json_extract(data, ?)", "$.#{path}")
@@ -261,21 +262,25 @@ module Database
 
   # Resolve a filter value for SQLite JSON matching.
   # Returns nil if the value can't be resolved, otherwise a hash:
-  #   { type: :entity, handle: "...", collection: "..." }  — for entity prefix_id lookups
-  #   { type: :scalar, value: "..." }                       — for plain value comparison
+  #   { type: :entity, prefix_id: "cnety_..." }  — for entity prefix_id lookups
+  #   { type: :scalar, value: "..." }              — for plain value comparison
+  #
+  # NOTE: Locally, resolved entity hashes stored in SQLite data JSON do NOT include a
+  # "collection" key. They look like {"id": "cnety_...", "handle": "...", "title": "...",
+  # "content_path": "..."}. Always match on the "id" sub-key (the prefix_id).
   def self.resolve_filter_value_for_sqlite(field_path, value)
     return nil if value.nil? || (value.respond_to?(:empty?) && value.empty?)
 
-    # If value looks like a prefix_id (cnety_...), resolve to handle+collection
+    # If value looks like a prefix_id (cnety_...), use it directly for entity matching
     if value.is_a?(String) && value.start_with?("cnety_")
       row = connection[:entries].where(prefix_id: value).first
       return nil unless row
-      return { type: :entity, handle: row[:handle], collection: row[:collection_handle] }
+      return { type: :entity, prefix_id: value }
     end
 
-    # If value is a Hash with handle+collection (already a resolved entity ref)
-    if value.is_a?(Hash) && value["handle"] && value["collection"]
-      return { type: :entity, handle: value["handle"], collection: value["collection"] }
+    # If value is a Hash with an "id" key (already a resolved entity drop from Liquid context)
+    if value.is_a?(Hash) && value["id"]&.start_with?("cnety_")
+      return { type: :entity, prefix_id: value["id"] }
     end
 
     # Plain scalar
