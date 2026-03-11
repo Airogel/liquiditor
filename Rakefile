@@ -170,6 +170,23 @@ task :import_yaml, [ :theme ] do |_t, args|
   # -------------------------------------------------------------------------
   # 5. Import collections and entries
   # -------------------------------------------------------------------------
+  # Build a handle→collection index from content_paths so entity refs in any
+  # collection can be resolved without hardcoded path patterns.
+  handle_to_collection = {}
+  raw["content_paths"]&.each do |_path, config|
+    collection = config["content_key"]
+    entry_handle = config["content"]
+    next if collection.nil? || entry_handle.nil? || entry_handle == "_index"
+    handle_to_collection[entry_handle] = collection
+  end
+  # Also index directly from the YAML collection arrays (covers entries whose
+  # content_path may not appear in content_paths, e.g. unpublished entries).
+  raw.each do |key, values|
+    next if skip_keys.include?(key)
+    next unless values.is_a?(Array) && values.first.is_a?(Hash) && values.first.key?("handle")
+    values.each { |entry| handle_to_collection[entry["handle"]] = key if entry["handle"] }
+  end
+
   raw.each do |key, values|
     next if skip_keys.include?(key)
     next unless values.is_a?(Array) && values.first.is_a?(Hash) && values.first.key?("handle")
@@ -189,10 +206,10 @@ task :import_yaml, [ :theme ] do |_t, args|
       entry.each do |field_key, field_value|
         next if core_keys.include?(field_key)
 
-        # Convert entity reference arrays to compact format
+        # Convert entity reference arrays to compact {handle, collection} stubs
         if field_value.is_a?(Array) && field_value.first.is_a?(Hash) && field_value.first.key?("handle")
           data[field_key] = field_value.map do |ref|
-            collection_for_ref = infer_collection_from_yaml_ref(ref)
+            collection_for_ref = handle_to_collection[ref["handle"]] || infer_collection_from_yaml_ref(ref)
             if collection_for_ref
               { "handle" => ref["handle"], "collection" => collection_for_ref }
             else
@@ -200,7 +217,7 @@ task :import_yaml, [ :theme ] do |_t, args|
             end
           end
         elsif field_value.is_a?(Hash) && field_value.key?("handle") && !field_value.key?("body")
-          collection_for_ref = infer_collection_from_yaml_ref(field_value)
+          collection_for_ref = handle_to_collection[field_value["handle"]] || infer_collection_from_yaml_ref(field_value)
           data[field_key] = if collection_for_ref
             { "handle" => field_value["handle"], "collection" => collection_for_ref }
           else

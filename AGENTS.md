@@ -483,6 +483,44 @@ When creating or updating forms in templates:
 
 ## Guidelines
 
+### Never Hard-Code Content Paths or URLs
+
+**Do not hard-code content paths (e.g., `/lectures-by-chapter/some-slug`) or internal URLs in templates.** Content paths are determined by the CMS routing configuration and can change — if a collection's routing pattern is updated, or an entry's handle changes, any hard-coded link will silently break.
+
+**Wrong — hard-coded content path:**
+```liquid
+<a href="/lectures-by-chapter/part_1_finding_clarity">Finding Clarity</a>
+```
+
+**Right — use the entry's `content_path` field, which the CMS provides automatically:**
+```liquid
+{% for part in parts.entries %}
+  <a href="{{ part.content_path }}">{{ part.title }}</a>
+{% endfor %}
+```
+
+**Wrong — hard-coded asset path:**
+```liquid
+<link rel="stylesheet" href="/application.css">
+<script src="/application.js" defer></script>
+```
+
+**Right — use the `asset_url` filter:**
+```liquid
+{{ 'application.css' | asset_url | stylesheet_tag }}
+{{ 'application.js' | asset_url | script_tag }}
+```
+
+**Why this matters:**
+- Collection routing can change (e.g., `/lectures-by-chapter/:handle` → `/courses/:handle`).
+- Entry handles can be renamed, changing their URL.
+- Hard-coded paths produce broken links that are invisible until someone clicks them.
+- Asset paths may include content hashes or CDN prefixes in production.
+
+**Acceptable hard-coded URLs:**
+- External third-party resources (Google Fonts CDN, external APIs).
+- The site root `/` when linking to the homepage (unless a homepage entry with a `url` field exists).
+
 - **Read before editing**: Always read existing templates and styles before making changes. Understand the current design system.
 - **Preserve the design system**: Match the existing visual language (colors, typography, spacing) unless the user asks for a redesign.
 - **Use semantic HTML**: Proper headings, landmarks, and element choices.

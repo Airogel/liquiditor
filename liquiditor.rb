@@ -1061,7 +1061,7 @@ get "/" do
 end
 
 get "/*" do
-  path = params["splat"].first
+  path = params["splat"].first.chomp("/")
   load_path(path)
 end
 
