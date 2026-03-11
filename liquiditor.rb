@@ -113,8 +113,9 @@ def load_path(path)
     <script>
     (function() {
       var v = #{current_v};
+      var es = null;
       function connect() {
-        var es = new EventSource('/livereload?v=' + v);
+        es = new EventSource('/livereload?v=' + v);
         es.addEventListener('reload', function(e) {
           var d = JSON.parse(e.data || '{}');
           if (typeof d.version === 'number') v = d.version;
@@ -127,9 +128,16 @@ def load_path(path)
         });
         es.onerror = function() {
           es.close();
+          es = null;
           setTimeout(connect, 3000);
         };
       }
+      // Close the SSE connection when leaving the page so the server-side
+      // thread is released immediately instead of waiting for the next
+      // keepalive write to detect the dead socket (up to 25s later).
+      window.addEventListener('pagehide', function() {
+        if (es) { es.close(); es = null; }
+      });
       connect();
     })();
     </script>
@@ -597,6 +605,12 @@ end
 LIVE_RELOAD_VERSION = [ 0 ]
 LIVE_RELOAD_MUTEX = Mutex.new
 LIVE_RELOAD_COND = ConditionVariable.new
+# Tracks open SSE connection count. Guarded by LIVE_RELOAD_MUTEX.
+# Capped at LIVE_RELOAD_MAX_CONNECTIONS to protect Puma's thread pool
+# from being exhausted by stale browser connections (e.g. back/forward
+# navigation where pagehide doesn't fire, or multiple open tabs).
+LIVE_RELOAD_CONN_COUNT = [ 0 ]
+LIVE_RELOAD_MAX_CONNECTIONS = 8
 
 configure do
   Thread.new do
@@ -629,6 +643,22 @@ get "/livereload" do
 
   client_version = params[:v].to_i
 
+  # Reject the connection if we're already at the cap. This prevents a burst
+  # of stale connections (e.g. rapid page navigation) from exhausting Puma's
+  # thread pool. The client will reconnect after 3s once slots free up.
+  at_capacity = LIVE_RELOAD_MUTEX.synchronize do
+    if LIVE_RELOAD_CONN_COUNT[0] >= LIVE_RELOAD_MAX_CONNECTIONS
+      true
+    else
+      LIVE_RELOAD_CONN_COUNT[0] += 1
+      false
+    end
+  end
+  if at_capacity
+    status 503
+    return "data: {\"error\":\"at capacity\"}\n\n"
+  end
+
   stream :keep_open do |out|
     safe_write = lambda do |data|
       out << data
@@ -638,13 +668,13 @@ get "/livereload" do
     end
 
     loop do
-      # Wait up to 25s for a reload signal, then send a keepalive comment and
-      # loop. This releases the ConditionVariable lock between waits so other
-      # threads can signal it, and sends SSE keepalives so proxies don't close
-      # an idle connection.
+      # Wait up to 8s for a reload signal, then send a keepalive comment and
+      # loop. A short timeout means we write to the socket frequently and
+      # detect a dead connection (closed browser tab / navigation away) within
+      # one cycle instead of waiting up to 25s.
       signaled = LIVE_RELOAD_MUTEX.synchronize do
         unless LIVE_RELOAD_VERSION[0] > client_version
-          LIVE_RELOAD_COND.wait(LIVE_RELOAD_MUTEX, 25)
+          LIVE_RELOAD_COND.wait(LIVE_RELOAD_MUTEX, 8)
         end
         LIVE_RELOAD_VERSION[0] > client_version
       end
@@ -656,11 +686,13 @@ get "/livereload" do
         break unless safe_write.call("event: reload\n")
         break unless safe_write.call("data: #{payload}\n\n")
       else
-        # Keepalive — no change yet
+        # Keepalive — no change yet. The write will raise if the client is gone,
+        # causing safe_write to return false and break the loop immediately.
         break unless safe_write.call(": keepalive\n\n")
       end
     end
   ensure
+    LIVE_RELOAD_MUTEX.synchronize { LIVE_RELOAD_CONN_COUNT[0] -= 1 }
     begin
       out.close
     rescue
