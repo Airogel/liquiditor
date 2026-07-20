@@ -146,6 +146,11 @@ See `docs/ACCOUNT_SETUP.md` for the full walkthrough.
 # Pull entire theme from CMS (database + templates + assets)
 bin/airogelcms $THEME download_theme
 
+# Also pull unpublished/draft entries (omitted by default) so you can preview
+# work-in-progress content locally before publishing
+bin/airogelcms $THEME download_database --include-unpublished
+bin/airogelcms $THEME download_theme --include-unpublished
+
 # Push templates to CMS
 bin/airogelcms $THEME upload_templates
 

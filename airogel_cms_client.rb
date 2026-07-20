@@ -145,7 +145,7 @@ class AirogelCmsClient
       return
     end
 
-    templates = templates_response.is_a?(Array) ? templates_response : (templates_response["templates"] || [])
+    templates = extract_list(templates_response, "templates")
     FileUtils.mkdir_p(output_dir)
 
     templates.each do |template|
@@ -173,7 +173,7 @@ class AirogelCmsClient
       return
     end
 
-    assets = assets_response.is_a?(Array) ? assets_response : (assets_response["assets"] || [])
+    assets = extract_list(assets_response, "assets")
 
     if assets.empty?
       puts "No assets found"
@@ -456,10 +456,12 @@ class AirogelCmsClient
     make_request("/v1/accounts/#{account_id}/globals/#{global_id}")
   end
 
-  def create_global(account_id, handle:, title:, **fields)
+  def create_global(account_id, handle:, name: nil, title: nil, **fields)
+    # API uses "name" for globals; accept "title" as alias for CLI convenience
+    display_name = name || title
     make_post_request(
       "/v1/accounts/#{account_id}/globals",
-      { global: { handle: handle, title: title }.merge(fields) }
+      { global: { handle: handle, name: display_name }.merge(fields) }
     )
   end
 
@@ -476,20 +478,22 @@ class AirogelCmsClient
 
   # Export methods
 
-  def get_export(account_id, format: :yaml)
+  def get_export(account_id, format: :yaml, include_unpublished: false)
     endpoint = "/v1/accounts/#{account_id}/export.#{format}"
+    endpoint += "?include_unpublished=true" if include_unpublished
     make_raw_request(endpoint)
   end
 
-  def download_database(account_id, output_path)
+  def download_database(account_id, output_path, include_unpublished: false)
     puts "Downloading database export..."
+    puts "(including unpublished/draft entries)" if include_unpublished
 
     # Remove existing database.yml before downloading fresh copy
     if File.exist?(output_path)
       FileUtils.rm(output_path)
     end
 
-    result = get_export(account_id, format: :yaml)
+    result = get_export(account_id, format: :yaml, include_unpublished: include_unpublished)
 
     if result[:error]
       puts "✗ Error downloading export: #{result[:error]}"
@@ -501,7 +505,7 @@ class AirogelCmsClient
     true
   end
 
-  def download_theme(account_id, theme_path)
+  def download_theme(account_id, theme_path, include_unpublished: false)
     puts "Downloading theme to #{theme_path}..."
     puts
 
@@ -509,7 +513,7 @@ class AirogelCmsClient
 
     # Download database.yml
     database_path = File.join(theme_path, "database.yml")
-    download_database(account_id, database_path)
+    download_database(account_id, database_path, include_unpublished: include_unpublished)
 
     # Download templates
     puts
@@ -565,7 +569,7 @@ class AirogelCmsClient
       return stats
     end
 
-    templates_list = existing.is_a?(Array) ? existing : (existing["templates"] || [])
+    templates_list = extract_list(existing, "templates")
     existing_by_handle = templates_list.to_h { |t| [ t["handle"], t ] }
     puts "Found #{existing_by_handle.size} existing templates"
     puts
@@ -631,7 +635,7 @@ class AirogelCmsClient
       puts "⚠ This may be due to corrupted assets on the server. Continuing with upload (all files will be created as new)..."
       existing_by_full_path = {}
     else
-      assets_list = existing.is_a?(Array) ? existing : (existing["assets"] || [])
+      assets_list = extract_list(existing, "assets")
       # Build lookup key from path + filename (e.g., "fonts/flaticon.woff" or "application.css")
       # Skip assets with nil filenames to avoid errors
       existing_by_full_path = assets_list.compact.select { |a| a["filename"] }.to_h do |a|
@@ -698,6 +702,17 @@ class AirogelCmsClient
     end
 
     stats
+  end
+
+  # Extract a list of items from an API response that may be:
+  # - A bare Array (legacy)
+  # - A Hash with { "data" => [...] } (new unified shape)
+  # - A Hash with { "<fallback_key>" => [...] } (e.g., "templates", "assets")
+  def extract_list(response, fallback_key = nil)
+    return response if response.is_a?(Array)
+    return [] unless response.is_a?(Hash)
+
+    response["data"] || (fallback_key && response[fallback_key]) || []
   end
 
   private

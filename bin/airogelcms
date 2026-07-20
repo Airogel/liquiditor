@@ -22,7 +22,9 @@
 #
 #   # Theme operations
 #   download_theme      - Download entire theme (database + templates + assets)
+#                         (--include-unpublished to also pull draft entries)
 #   download_database   - Download just database.yml
+#                         (--include-unpublished to also pull draft entries)
 #   download_templates  - Download just templates
 #   download_assets     - Download just assets
 #   upload_theme        - Upload entire theme (templates + assets)
@@ -197,7 +199,9 @@ def print_usage
   puts ""
   puts "Theme Operations:"
   puts "  download_theme      - Download entire theme (database + templates + assets)"
+  puts "                        --include-unpublished to also pull draft entries"
   puts "  download_database   - Download just database.yml"
+  puts "                        --include-unpublished to also pull draft entries"
   puts "  download_templates  - Download just templates"
   puts "  download_assets     - Download just assets"
   puts "  upload_theme        - Upload entire theme (templates + assets)"
@@ -263,6 +267,7 @@ def print_usage
   puts "  bin/airogelcms mysite subscription_checkout --plan=plan_xxx"
   puts "  bin/airogelcms mysite subscription_status"
   puts "  bin/airogelcms jbsite download_theme"
+  puts "  bin/airogelcms jbsite download_database --include-unpublished"
   puts "  bin/airogelcms jbsite list_collections"
   puts '  bin/airogelcms jbsite create_collection --name="Blog Posts" --handle=posts'
   puts '  bin/airogelcms jbsite create_entry --collection=posts --handle=my-post --title="My Post"'
@@ -1009,13 +1014,13 @@ def main
   # Theme operations (existing)
   # ============================================================
   when "download_theme"
-    client.download_theme(account_id, theme_path)
+    client.download_theme(account_id, theme_path, include_unpublished: options[:include_unpublished] == true)
     import_yaml_to_sqlite(theme_path)
     generate_liquid_docs(theme_path)
 
   when "download_database"
     database_path = File.join(theme_path, "database.yml")
-    client.download_database(account_id, database_path)
+    client.download_database(account_id, database_path, include_unpublished: options[:include_unpublished] == true)
     import_yaml_to_sqlite(theme_path)
     generate_liquid_docs(theme_path)
 
@@ -1059,7 +1064,7 @@ def main
     if templates.is_a?(Hash) && templates["error"]
       puts "Error: #{templates["error"]}"
     else
-      templates_list = templates.is_a?(Array) ? templates : (templates["templates"] || [])
+      templates_list = templates.is_a?(Hash) ? (templates["data"] || templates["templates"] || []) : Array(templates)
       puts "Templates for account #{account_id}:"
       templates_list.each do |template|
         puts "  - #{template["handle"]} (#{template["id"]})"
@@ -1072,7 +1077,7 @@ def main
     if assets.is_a?(Hash) && assets["error"]
       puts "Error: #{assets["error"]}"
     else
-      assets_list = assets.is_a?(Array) ? assets : (assets["assets"] || [])
+      assets_list = assets.is_a?(Hash) ? (assets["data"] || assets["assets"] || []) : Array(assets)
       puts "Assets for account #{account_id}:"
       assets_list.each do |asset|
         path = asset["path"].to_s.empty? ? "" : "#{asset["path"]}/"
@@ -1320,13 +1325,13 @@ def main
     handle_api_response(response)
 
   when "create_global"
-    unless options[:handle] && options[:title]
-      output_result(success: false, error: "Missing required options: --handle, --title")
+    unless options[:handle] && (options[:name] || options[:title])
+      output_result(success: false, error: "Missing required options: --handle, --name (or --title)")
       exit 1
     end
     handle = options.delete(:handle)
-    title = options.delete(:title)
-    response = client.create_global(account_id, handle: handle, title: title, **options)
+    name = options.delete(:name) || options.delete(:title)
+    response = client.create_global(account_id, handle: handle, name: name, **options)
     handle_api_response(response, "Global created successfully")
 
   when "update_global"
