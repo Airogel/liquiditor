@@ -567,6 +567,108 @@ module Extensions
   end
 
   # ---------------------------------------------------------------------------
+  # DocTag — mirrors CMS lib/liquid/tags/doc_tag.rb
+  # Documents snippet/block parameters and usage; never renders output. Body
+  # is captured verbatim (like Liquid::Raw) so @example blocks containing
+  # literal {% tags %} are never executed.
+  # ---------------------------------------------------------------------------
+
+  class DocTag < Liquid::Block
+    SYNTAX = /\A\s*\z/
+    PARAM_PATTERN = /\A@param\s+(?:\{(?<type>\w+)\}\s+)?(?<name>\[[^\]]+\]|[\w.]+)(?:\s*-\s*(?<description>.*))?\z/
+
+    def initialize(tag_name, markup, parse_context)
+      super
+      unless SYNTAX.match?(markup)
+        raise Liquid::SyntaxError, "Syntax Error in 'doc' - doc tag does not accept arguments"
+      end
+    end
+
+    def parse(tokens)
+      @body = +""
+      while (token = tokens.shift)
+        if token =~ Liquid::BlockBody::FullTokenPossiblyInvalid && block_delimiter == Regexp.last_match(2)
+          parse_context.trim_whitespace = (token[-3] == Liquid::WhitespaceControl)
+          @body << Regexp.last_match(1) if Regexp.last_match(1) != ""
+          return
+        end
+        @body << token unless token.empty?
+      end
+
+      raise_tag_never_closed(block_name)
+    end
+
+    def render_to_output_buffer(_context, output)
+      output
+    end
+
+    def nodelist
+      [ @body ]
+    end
+
+    def blank?
+      true
+    end
+
+    def description
+      annotations[:description]
+    end
+
+    def parameters
+      annotations[:params]
+    end
+
+    def examples
+      annotations[:examples]
+    end
+
+    private
+
+    def annotations
+      @annotations ||= parse_annotations(@body)
+    end
+
+    def parse_annotations(body)
+      description_lines = []
+      params = []
+      examples = []
+      current_example = nil
+
+      body.to_s.each_line do |raw_line|
+        line = raw_line.strip
+
+        if (match = PARAM_PATTERN.match(line))
+          current_example = nil
+          name = match[:name]
+          optional = name.start_with?("[") && name.end_with?("]")
+          description = match[:description]&.strip
+          params << {
+            type: match[:type],
+            name: optional ? name[1..-2] : name,
+            optional: optional,
+            description: description.nil? || description.empty? ? nil : description
+          }
+        elsif line.start_with?("@example")
+          current_example = +""
+          examples << current_example
+        elsif current_example
+          current_example << raw_line
+        elsif line.start_with?("@")
+          current_example = nil
+        elsif params.empty? && examples.empty?
+          description_lines << raw_line
+        end
+      end
+
+      {
+        description: description_lines.join.strip,
+        params: params,
+        examples: examples.map(&:strip)
+      }
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Stub tags — legacy/e-commerce, not needed for template preview
   # ---------------------------------------------------------------------------
 

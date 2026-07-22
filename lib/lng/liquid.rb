@@ -18,6 +18,7 @@ default_environment.register_tag("form_for", Extensions::FormFor)
 default_environment.register_tag("cms_scripts", Extensions::CmsScripts)
 default_environment.register_tag("paginate", Extensions::Paginate)
 default_environment.register_tag("query", Extensions::QueryTag)
+default_environment.register_tag("doc", Extensions::DocTag)
 
 # Filters
 default_environment.register_filter(Filters)
