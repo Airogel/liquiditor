@@ -7,10 +7,12 @@ This guide covers the workflow for importing content into Airogel CMS and syncin
 1. [How Liquiditor + CMS Sync Works](#how-liquiditor--cms-sync-works)
 2. [Import Order of Operations](#import-order-of-operations)
 3. [CLI Tool Reference](#cli-tool-reference)
-4. [Template Variables](#template-variables)
-5. [Routing Patterns](#routing-patterns)
-6. [WordPress Import Workflow](#wordpress-import-workflow)
-7. [Common Pitfalls](#common-pitfalls)
+4. [MCP-Direct Workflow (No CLI/API Key Required)](#mcp-direct-workflow-no-cliapi-key-required)
+5. [Template Variables](#template-variables)
+6. [Routing Patterns](#routing-patterns)
+7. [WordPress Import Workflow](#wordpress-import-workflow)
+8. [Handling Missing or Dead Source Media](#handling-missing-or-dead-source-media)
+9. [Common Pitfalls](#common-pitfalls)
 
 ---
 
@@ -294,6 +296,27 @@ bin/airogelcms {THEME} extract_asset_urls --file=page.html
 
 ---
 
+## MCP-Direct Workflow (No CLI/API Key Required)
+
+If you (or the agent doing the import) have an authenticated Airogel CMS MCP connection, you can skip `bin/airogelcms` and the `.env` API key entirely and call the MCP tools directly: `blueprints_save`, `collections_save`, `templates_save`, `assets_upload_from_url`, `entries_save`, `navigation_items_save`, `globals_save`. This is usually faster for a one-off import because there's no theme scaffold or credential setup required first.
+
+Still parse the WordPress export locally first — `lib/wordpress_parser.rb` (see below) has no MCP dependency, so run it with plain `ruby`/`bin/airogelcms parse_wordpress` regardless of which path you use for the CMS side.
+
+**Before writing anything:**
+
+1. `accounts_list` — confirm the target account and note whether it already has starter/boilerplate content (a fresh account is usually pre-seeded with a generic template: Contact, Events, Newsletter, News collections, a `page` collection with placeholder entries, `main_navigation`, and a `site` global). List `collections_list`, `blueprints_list`, `entries_list` for `page`, and `navigation_items_list` for `main_navigation` before creating anything, so you don't collide with or blindly overwrite existing handles (e.g. an `about` page entry may already exist — update it in place rather than creating a duplicate).
+2. `templates_get` for `theme` (the layout) and any existing content template (e.g. `news_post`/`news_index`) to learn the site's actual CSS class vocabulary (e.g. `card-grid`, `page-header`, `prose`, `text-link`). Reuse those classes in new templates instead of inventing new ones or assuming a Tailwind utility-class setup — starter themes here use hand-written semantic classes, not utility classes.
+3. `theme_generate_liquid_docs` — canonical, per-account reference for exact global/collection/navigation/form variable names. Always regenerate and read this before writing new Liquid, per the account's own MCP server instructions.
+
+**Creation order** mirrors the CLI order of operations: blueprint(s) → collection → assets → templates → link templates onto the collection (`collections_save` again with `template_handle`/`index_template_handle`) → entries → navigation → globals.
+
+**QC before calling it done:**
+
+- `theme_validate` — flags missing templates, orphaned entries, missing `published_at` on date-routed collections, missing index config, duplicate content paths. Re-run after entries are created.
+- `preview_render_path` for the index page, at least one normal entry, and any edge-case entry (e.g. one missing an optional field like an image) — check `status: "ok"` and eyeball the rendered HTML. This is more trustworthy than the raw `entries_save`/`entries_get` response for verifying field values actually resolve (see the image-field gotcha below).
+
+---
+
 ## Template Variables
 
 ### Critical: Variable Name = Collection Handle
@@ -476,6 +499,59 @@ end
 
 ---
 
+## Handling Missing or Dead Source Media
+
+A WordPress XML/WXR export contains only **metadata and URLs** for attachments — never the binary files. If the exported site is offline (common for old blogs), every `<wp:attachment_url>` and every inline `<img src>` in `content:encoded` points at a domain that will 404 or fail to resolve. Don't assume `assets_upload_from_url` will work against those URLs; check first.
+
+**1. Check whether the source domain is actually alive:**
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 "https://old-site.example.com/wp-content/uploads/2020/01/cover.jpg"
+```
+
+Exit code 6 / connection failure means DNS doesn't resolve at all — the domain is gone, not just the file.
+
+**2. If the domain is dead, try the Wayback Machine** before giving up on an image. The plain availability API works with an **unencoded** URL (percent-encoding the URL in the query string causes false "not archived" results):
+
+```bash
+curl -s "http://archive.org/wayback/available?url=https://old-site.example.com/wp-content/uploads/2020/01/cover.jpg"
+```
+
+If `archived_snapshots.closest.url` is present, insert `id_` right after the timestamp segment to get the **raw file** instead of a wayback-toolbar-wrapped HTML page:
+
+```
+http://web.archive.org/web/20220410182347/https://old-site.example.com/...      ← wrapped page
+http://web.archive.org/web/20220410182347id_/https://old-site.example.com/...   ← raw file (use this)
+```
+
+WordPress often resizes images and rewrites the filename with a `-WIDTHxHEIGHT` suffix (e.g. `Cover-672x1024.jpg`) that the Wayback Machine may not have crawled even when the original full-size file was archived. Try stripping that suffix and re-checking before concluding an image is unrecoverable.
+
+**3. If it's a known published work (book cover, movie poster, product photo), a subject-specific API is often more reliable than either the dead domain or Wayback.** For book covers specifically:
+
+```bash
+# Open Library — no API key required
+curl -s "https://openlibrary.org/search.json?q=TITLE+AUTHOR&limit=1"
+# → take doc.cover_i, then fetch:
+# https://covers.openlibrary.org/b/id/{cover_i}-L.jpg
+```
+
+Google Books' `volumes` API is a similar fallback but is aggressively rate-limited per-project and may return `429 RESOURCE_EXHAUSTED` with no advance warning — don't rely on it as the only path.
+
+**4. Verify every substitute URL resolves before uploading**, in one pass, rather than discovering failures mid-import:
+
+```python
+import urllib.request
+req = urllib.request.Request(url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+with urllib.request.urlopen(req, timeout=15) as resp:
+    print(resp.status, resp.headers.get('Content-Type'))
+```
+
+**5. Strip now-dead `<img>` references out of body HTML** — don't leave them in even though the surrounding text is otherwise fine. A broken inline image is worse than no image. If a post embeds one image that duplicates whatever you set as `featured_image`, drop the inline copy entirely (the template already renders the featured image above the body). If a post has a multi-image gallery you couldn't individually re-source, strip the `<img>` tags but leave any surrounding captions/text — better to lose a decorative image than fabricate one, and better than leaving a broken-image icon in the middle of the article.
+
+**6. Tell the user what you couldn't recover.** Don't silently drop content. If some percentage of images couldn't be sourced from any of the above, say so and name which entries are affected, so they can supply a file directly if they have one squirreled away.
+
+---
+
 ## Common Pitfalls
 
 ### 1. Template variable doesn't match collection handle
@@ -530,3 +606,25 @@ Variables are NOT automatically available inside `{% render %}` partials. Pass t
 ```liquid
 {% render 'header', navigation: navigation, site: site %}
 ```
+
+### 9. Image blueprint field looks empty after `entries_save`/`entries_get` — it may not be
+
+For a blueprint field of type `image`, set the value to the asset's **`full_path`** (e.g. `"reviews/cover.jpg"`, from the `assets_upload_from_url`/`assets_list` response) — not the asset's `id` (`actast_...`) and not its `url`. Both of those alternatives silently fail to attach.
+
+The confusing part: even when set correctly, the `fields` object in the `entries_save`/`entries_get` JSON response shows the image field as `{"name":"image","record":{...,"data":{}}}` — indistinguishable from an unset field by eye. **Don't trust that response to verify an image field.** Use `preview_render_path` on the entry and check that the rendered `<img src>` is a real asset URL — that's the only reliable confirmation.
+
+### 10. `bin/airogelcms parse_wordpress` requires `lib/wordpress_parser.rb`, which may not exist
+
+The CLI (`bin/airogelcms`) and this doc both reference `lib/wordpress_parser.rb`, but depending on the state of the repo it may not actually be present — check before assuming `parse_wordpress` works. It needs to expose:
+
+```ruby
+WordPressParser.new(file_path).parse(type: :all) # or :posts, :pages, :attachments, :categories, :tags, :menus, :site
+# => { posts: [...], pages: [...], attachments: [...], categories: [...], tags: [...], menus: [...], site: {...} }
+```
+
+Built on `nokogiri` (already in the `Gemfile`) against the WXR namespaces (`wp:`, `content:`, `excerpt:`, `dc:`). Key extraction points:
+
+- Posts/pages: `wp:post_type`, `wp:status` (`publish` → `published: true`), `wp:post_name` (fall back to a slugified title if blank — WordPress sometimes leaves this empty or stuck on a default like `sample-page`), `content:encoded` (body), `excerpt:encoded`, `category[@domain='category']` / `category[@domain='post_tag']` for taxonomy.
+- Attachments: `wp:attachment_url`, `wp:post_parent` (links an attachment back to the post that used it).
+- Menus: `nav_menu_item` posts, with target info spread across `wp:postmeta` key/value pairs (`_menu_item_type`, `_menu_item_object_id`, `_menu_item_url`, `_menu_item_menu_item_parent`) rather than plain fields.
+- Strip Gutenberg block comments (`<!-- wp:... -->` / `<!-- /wp:... -->`) from `content:encoded` before using it as HTML — they're WordPress editor metadata, not meant to render.
